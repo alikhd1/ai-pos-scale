@@ -1,0 +1,21 @@
+# build output
+build/
+dist/
+*.spec
+__pycache__/
+*.pyc
+
+# runtime data created next to the app
+config.json
+items_db.pkl
+items_db.pkl.corrupt
+invoices/
+aipos.log
+selftest_report.txt
+selftest_receipt.*
+test_receipt.bin
+last_receipt.bin
+receipt_preview.png
+
+# large downloaded weights (build.bat re-downloads them)
+models/*.pth

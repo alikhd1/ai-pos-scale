@@ -1,0 +1,21 @@
+# AI POS Scale - runtime + build requirements (Windows, 64-bit Python 3.10+)
+# CPU-only PyTorch wheels come from the official PyTorch index:
+--extra-index-url https://download.pytorch.org/whl/cpu
+
+numpy>=1.26
+opencv-python>=4.9
+torch>=2.2
+# torchvision is NOT required: MobileNetV2 is defined in ai_engine.py (pure torch) and
+# loads the official torchvision checkpoint. Install it only for the equivalence test.
+PyQt6>=6.6
+pyserial>=3.5
+Pillow>=10.0
+pywin32>=306; sys_platform == "win32"
+
+# Persian / Arabic text shaping for the bitmap receipt renderer
+arabic-reshaper>=3.0
+python-bidi>=0.4.2
+
+# packaging
+pyinstaller>=6.6
+pyinstaller-hooks-contrib>=2024.0
