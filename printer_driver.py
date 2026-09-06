@@ -73,10 +73,19 @@ class InvoiceLine:
     price_per_kg: float
     item_id: str = ""
     confidence: float = 0.0
+    quantity: int = 1                 # pieces recognised on the tray (display, or pricing when unit == "pcs")
+    unit: str = "kg"                  # "kg" = priced by weight, "pcs" = priced per piece
+    price_per_piece: float = 0.0
 
     @property
     def total(self) -> float:
+        if self.unit == "pcs":
+            return round(self.quantity * self.price_per_piece, 4)
         return round(self.weight_kg * self.price_per_kg, 4)
+
+    @property
+    def display_name(self) -> str:
+        return f"{self.name} x{self.quantity}" if self.quantity > 1 else self.name
 
 
 @dataclass
@@ -98,7 +107,9 @@ class Invoice:
             "store_name": self.store_name,
             "currency": self.currency,
             "lines": [{"item_id": l.item_id, "name": l.name, "weight_kg": round(l.weight_kg, 4),
-                       "price_per_kg": l.price_per_kg, "total": l.total, "confidence": round(l.confidence, 3)}
+                       "price_per_kg": l.price_per_kg, "quantity": l.quantity, "unit": l.unit,
+                       "price_per_piece": l.price_per_piece,
+                       "total": l.total, "confidence": round(l.confidence, 3)}
                       for l in self.lines],
             "grand_total": self.grand_total,
         }
@@ -433,7 +444,8 @@ class ReceiptRenderer:
         row([L["item"], L["weight"], L["price"], L["total"]], self.font_bold, widths, aligns)
         rule(1)
         for ln in inv.lines:
-            row([ln.name, fmt_weight(ln.weight_kg, weight_decimals), fmt_money(ln.price_per_kg, currency_decimals),
+            unit_price = ln.price_per_piece if ln.unit == "pcs" else ln.price_per_kg
+            row([ln.display_name, fmt_weight(ln.weight_kg, weight_decimals), fmt_money(unit_price, currency_decimals),
                  fmt_money(ln.total, currency_decimals)], self.font, widths, aligns)
         rule()
         line(f"{L['items']}: {len(inv.lines)}", self.font_small)
@@ -519,8 +531,9 @@ class ReceiptPrinter:
         b.bold(True).text(f"{L.get('item', 'Item')[:name_w]:<{name_w}}{L.get('weight', 'Kg')[:wcol]:>{wcol}}"
                           f"{L.get('price', 'Price')[:pcol]:>{pcol}}{L.get('total', 'Total')[:tcol]:>{tcol}}").bold(False)
         for ln in inv.lines:
-            b.text(f"{ln.name[:name_w]:<{name_w}}{fmt_weight(ln.weight_kg, w_dec):>{wcol}}"
-                   f"{fmt_money(ln.price_per_kg, cur_dec):>{pcol}}{fmt_money(ln.total, cur_dec):>{tcol}}")
+            unit_price = ln.price_per_piece if ln.unit == "pcs" else ln.price_per_kg
+            b.text(f"{ln.display_name[:name_w]:<{name_w}}{fmt_weight(ln.weight_kg, w_dec):>{wcol}}"
+                   f"{fmt_money(unit_price, cur_dec):>{pcol}}{fmt_money(ln.total, cur_dec):>{tcol}}")
         b.text("-" * n)
         b.align("right").bold(True).size(2, 2)
         b.text(f"{L.get('grand_total', 'TOTAL')}: {fmt_money(inv.grand_total, cur_dec, inv.currency)}")

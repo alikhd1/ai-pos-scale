@@ -260,6 +260,7 @@ class ScaleReader(threading.Thread, BaseScale):
         self.frames_received = 0
         self.readings = 0
         self.parse_failures = 0
+        self.unstable_readings = 0
         self.last_data_time = 0.0
         self.recent_frames: Deque[Tuple[float, bytes, Optional[WeightReading]]] = deque(maxlen=40)
         self._ser = None
@@ -282,6 +283,7 @@ class ScaleReader(threading.Thread, BaseScale):
         now = time.time()
         return {"status": self.status, "error": self.last_error, "bytes": self.bytes_received,
                 "frames": self.frames_received, "readings": self.readings, "parse_failures": self.parse_failures,
+                "unstable": self.unstable_readings,
                 "data_age": (now - self.last_data_time) if self.last_data_time else None,
                 "port": self.config.get("port", ""), "baudrate": self.config.get("baudrate", 9600)}
 
@@ -366,8 +368,12 @@ class ScaleReader(threading.Thread, BaseScale):
             self.parse_failures += 1
             return
         self.readings += 1
-        if cfg.get("stable_only") and not reading.stable:
-            return
+        if not reading.stable:
+            self.unstable_readings += 1
+        # Never drop a parsed weight here: "stable_only" decides what may be
+        # INVOICED (app._weight_ok), not what may be DISPLAYED.  Filtering in the
+        # driver made latest() stay None forever on an indicator that always
+        # reports motion, while the settings dialog happily reported a weight.
         with self._lock:
             self._latest = reading
         for cb in self._subs:
@@ -481,7 +487,8 @@ def test_connection(config: Dict, seconds: float = 2.5) -> Dict:
     samples = [printable(f) for f in frames[:6]]
     if readings:
         r = readings[-1]
-        return {"ok": True, "message": f"{r.weight_kg:.3f} kg", "raw": samples, "reading": r}
+        note = "" if r.stable else " (unstable - the load is still moving)"
+        return {"ok": True, "message": f"{r.weight_kg:.3f} kg{note}", "raw": samples, "reading": r}
     if raw:
         return {"ok": False, "message": "data received but no weight could be parsed: " + " | ".join(samples[:3]), "raw": samples, "reading": None}
     return {"ok": False, "message": "port opened but no data received (check baud rate, cable, poll command)", "raw": [], "reading": None}
@@ -524,7 +531,12 @@ def diagnose_scale(config: Dict, progress: Optional[Callable[[str], None]] = Non
     if readings:
         r = readings[-1]
         say(f"    OK: last weight {r.weight_kg:.3f} kg (stable={r.stable}) raw='{r.raw}'")
-        return {"ok": True, "summary": f"{r.weight_kg:.3f} kg", "report": "\n".join(lines), "suggestion": None}
+        if all(not x.stable for x in readings):
+            say("    NOTE: every reading is flagged UNSTABLE (motion). The port, baud rate and parser are")
+            say("    fine and the weight is shown on the main screen, but with 'Accept stable readings only'")
+            say("    ticked the Add button waits until the load settles.")
+        summary = f"{r.weight_kg:.3f} kg" + ("" if r.stable else " (unstable)")
+        return {"ok": True, "summary": summary, "report": "\n".join(lines), "suggestion": None}
     if raw:
         if _looks_like_text(raw):
             say("    Text data arrives but no number could be extracted. Send this report to support; the protocol needs a parser rule.")

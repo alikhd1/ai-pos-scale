@@ -1,13 +1,12 @@
 """
 app.py
 ------
-AI POS Scale – main application (PyQt6).
+AI POS Scale - main application (PyQt6).
 
-Left  : live AI camera feed with the tray area outline, detected-item badge and
-        the buttons: Train New Item / Add Angle Sample / Manage Items,
-        Tray Area (calibration) / Capture Empty Tray.
-Right : live weight, sales invoice table (name / kg / price per kg / total /
-        delete), grand total, Clear, Checkout & Print, Settings.
+Left  : live camera with the tray outline, a box and a label around every
+        detected object (up to five), and the buttons Train New Item /
+        Add Angle Sample / Manage Items / Tray Area / Capture Empty Tray.
+Right : live weight, sales invoice, grand total, Clear, Checkout & Print, Settings.
 
 Run from source :  python app.py            (add --lang en for English UI)
 Head-less check :  python app.py --selftest (writes selftest_report.txt)
@@ -149,6 +148,29 @@ def receipt_labels() -> dict:
             "price": tr("col_price"), "total": tr("col_total"), "grand_total": tr("grand_total"), "items": tr("items")}
 
 
+def scale_mode_reason(settings: SettingsManager) -> str:
+    """Single source of truth for which scale object exists and why.
+
+    Used by the status pill's tooltip, the self-test report and the head-less
+    wiring test, so "what the settings dialog tested" and "what the main window
+    actually built" can never drift apart again without a test failing.
+    """
+    sc = settings.section("scale")
+    port = (sc.get("port") or "").strip()
+    if not sc.get("enabled", True):
+        return "SimulatedScale: scale.enabled = false"
+    if sc.get("simulate"):
+        return f"SimulatedScale: scale.simulate = true (port {port or '-'} ignored)"
+    if not port:
+        return "SimulatedScale: no COM port configured"
+    return f"ScaleReader: {port} @ {sc.get('baudrate')} {sc.get('bytesize')}{sc.get('parity')}{sc.get('stopbits')}"
+
+
+def scale_is_simulated(settings: SettingsManager) -> bool:
+    sc = settings.section("scale")
+    return bool(sc.get("simulate") or not (sc.get("port") or "").strip() or not sc.get("enabled", True))
+
+
 # --------------------------------------------------------------------------- #
 # Head-less self-test (also used by build.bat and on the target machine)
 # --------------------------------------------------------------------------- #
@@ -156,7 +178,8 @@ def run_selftest(settings: SettingsManager, video_file: str = "") -> int:
     from rtk_camera import diagnose, open_camera
     from scale_driver import parse_weight, list_serial_ports, diagnose_scale
     from printer_driver import ReceiptPrinter, Invoice, InvoiceLine, list_windows_printers
-    from ai_engine import FeatureExtractor, ItemDatabase, Recognizer, TrayRegion
+    from ai_engine import FeatureExtractor, ItemDatabase, Recognizer, TrayRegion, MODE_OBJECT, MODE_TRAY
+    from tray_segment import TraySegmenter
 
     lines: List[str] = [f"AI POS Scale self-test  {dt.datetime.now():%Y-%m-%d %H:%M:%S}",
                         f"frozen={is_frozen()}  app_dir={app_dir()}", f"config={settings.path}", ""]
@@ -208,11 +231,31 @@ def run_selftest(settings: SettingsManager, video_file: str = "") -> int:
         emb = fx.embed(crop)
         lines.append(f"embedding dim={emb.shape[0]} norm={np.linalg.norm(emb):.3f} time={1000 * (time.time() - t0):.0f} ms bbox={box}")
         db = ItemDatabase(settings.resolve("ai.db_file"))
-        lines.append(f"items database: {len(db)} items, empty-tray reference: {'yes' if db.has_background else 'NO'} ({db.path})"
+        if db.backbone_mismatch:
+            ok = False
+            lines.append(f"items database was enrolled with backbone {db.backbone_mismatch!r}: every item must be re-trained")
+        lines.append(f"items database: {len(db)} items "
+                     f"({len(db.items_in_mode(MODE_OBJECT))} per-object, {len(db.items_in_mode(MODE_TRAY))} whole-tray), "
+                     f"empty-tray embeddings: {'yes' if db.has_background else 'NO'}, "
+                     f"empty-tray image: {'yes' if db.has_background_image else 'NO'} ({db.path})"
                      + (f"  LOAD ERROR: {db.load_error}" if db.load_error else ""))
+        model = db.empty_tray_model()
+        if model is not None:
+            seg = TraySegmenter(model, min_area_frac=float(settings.get("ai.min_area_frac", 0.008)),
+                                max_objects=int(settings.get("ai.max_objects", 5)))
+            r = seg.segment(test_img)
+            lines.append(f"segmentation: {r.count} regions, intrusion={r.intrusion}, unreliable={r.unreliable}, {r.ms:.0f} ms")
+        else:
+            lines.append("segmentation: DISABLED (capture the empty tray to enable multi-object detection)")
         if len(db) or db.has_background:
-            r = Recognizer(db, float(settings.get("ai.confidence_threshold", 0.65)), 3, float(settings.get("ai.empty_threshold", 0.88))).match(emb)
-            lines.append(f"match on test frame: {r.name or '-'} score={r.score:.3f} empty_score={r.empty_score:.3f} empty={r.empty}")
+            rec = Recognizer(db, float(settings.get("ai.confidence_threshold", 0.65)), 3,
+                             float(settings.get("ai.empty_threshold", 0.88)))
+            r = rec.match(emb, MODE_TRAY)
+            lines.append(f"match on test frame: {r.name or '-'} score={r.score:.3f} thr={r.threshold:.3f} "
+                         f"accepted={r.accepted} empty={r.empty}")
+        pairs = db.confusable_pairs(5)
+        if pairs:
+            lines.append("items that look alike to the camera: " + ", ".join(f"{a}~{b} ({c:.0%})" for a, b, c in pairs))
     except Exception as exc:
         ok = False
         lines.append(f"AI FAILED: {exc}")
@@ -223,8 +266,12 @@ def run_selftest(settings: SettingsManager, video_file: str = "") -> int:
     lines.append(f"ports: {list_serial_ports() or 'none'}")
     sample = parse_weight(b"ST,GS,+  1.234kg\r\n")
     lines.append(f"parser: {'OK' if sample and abs(sample.weight_kg - 1.234) < 1e-6 else 'FAILED'}")
-    if sc.get("simulate") or not sc.get("port"):
-        lines.append("hardware scale: simulated (no port configured or simulation enabled)")
+    lines.append(f"mode: {scale_mode_reason(settings)}")
+    if scale_is_simulated(settings):
+        if (sc.get("port") or "").strip() and sc.get("simulate"):
+            ok = False
+            lines.append("  PROBLEM: a COM port is configured but simulation is ON, so the app shows a "
+                         "simulated weight while the settings dialog tests the real port.")
     else:
         rep = diagnose_scale(sc, quick=True)
         lines.append(f"hardware scale on {sc['port']}: {'OK ' if rep['ok'] else 'PROBLEM '}{rep['summary']}")
@@ -277,12 +324,14 @@ from scale_driver import (ScaleReader, SimulatedScale, list_serial_ports, diagno
                           printable, hexdump)
 from printer_driver import (ReceiptPrinter, Invoice, InvoiceLine, list_windows_printers, default_windows_printer,
                             fmt_money, fmt_weight)
-from ai_engine import (FeatureExtractor, ItemDatabase, RecognitionEngine, Recognition, Item, TrayRegion, make_thumbnail)
+from ai_engine import (FeatureExtractor, ItemDatabase, RecognitionEngine, Recognition, Detection, Item, TrayRegion,
+                       make_thumbnail, region_crop, MODE_OBJECT, MODE_TRAY)
+from tray_segment import BUILD_FRAMES, EmptyTrayModel
 
 
 class Bus(QObject):
     """Thread-safe bridge: worker threads emit, GUI slots receive."""
-    recognition = pyqtSignal(object, object)     # Recognition, crop
+    recognition = pyqtSignal(object, object)     # Recognition, frame
     weight = pyqtSignal(object)                  # WeightReading
     embedding_ready = pyqtSignal(str, object)    # token, embeddings (n, 1280)
     model_ready = pyqtSignal(object, object)     # FeatureExtractor | None, error | None
@@ -299,6 +348,7 @@ QLabel#title { font-size: 20px; font-weight: 600; color: #9fb3ff; }
 QLabel#weight { font-size: 54px; font-weight: 700; color: #7CFC9A; font-family: Consolas, 'Segoe UI', monospace; }
 QLabel#total { font-size: 34px; font-weight: 700; color: #ffd166; }
 QLabel#detected { font-size: 26px; font-weight: 700; color: #ffffff; }
+QLabel#banner { font-size: 16px; font-weight: 700; color: #14171c; background: #ffcc4d; border-radius: 8px; padding: 8px; }
 QPushButton { background: #2b3140; border: 1px solid #3b4252; border-radius: 8px; padding: 10px 14px; font-weight: 600; }
 QPushButton:hover { background: #363d4f; }
 QPushButton:pressed { background: #1f2430; }
@@ -309,6 +359,7 @@ QPushButton#success { background: #1f9d55; border-color: #1f9d55; font-size: 18p
 QPushButton#success:hover { background: #26b463; }
 QPushButton#danger { background: #a1343e; border-color: #a1343e; }
 QPushButton#danger:hover { background: #c03f4b; }
+QPushButton#warn { background: #8a6d1f; border-color: #8a6d1f; }
 QTableWidget { background: #1b1f27; alternate-background-color: #20252f; gridline-color: #2c3340; border: 1px solid #2c3340; border-radius: 6px; }
 QHeaderView::section { background: #262c38; padding: 8px; border: none; font-weight: 600; }
 QTableWidget::item { padding: 6px; }
@@ -325,9 +376,10 @@ QSlider::handle:horizontal { width: 22px; margin: -8px 0; background: #9fb3ff; b
 QStatusBar { background: #0f1115; color: #9aa3b5; font-size: 13px; }
 QCheckBox::indicator, QRadioButton::indicator { width: 20px; height: 20px; }
 """
-WEIGHT_STYLE_FRESH = "color:#7CFC9A"
-WEIGHT_STYLE_UNSTABLE = "color:#ffcc4d"
-WEIGHT_STYLE_STALE = "color:#6f7a8f"
+PILL = "padding:3px 10px;border-radius:10px;background:%s;font-size:13px"
+PILL_NEUTRAL, PILL_OK, PILL_WARN, PILL_BAD = "#2a2f3a", "#1f9d55", "#8a6d1f", "#a1343e"
+COL_OK, COL_UNKNOWN, COL_PENDING, COL_BAD, COL_EMPTY = "#38d67a", "#7f8cff", "#8a6d1f", "#a1343e", "#8a94a8"
+WEIGHT_FRESH, WEIGHT_UNSTABLE, WEIGHT_STALE = "color:#7CFC9A", "color:#ffcc4d", "color:#6f7a8f"
 
 
 # ------------------------------------------------------------------ helpers
@@ -370,19 +422,23 @@ def ask(parent, text) -> bool:
 
 # ------------------------------------------------------------ video view
 class VideoWidget(QWidget):
-    """Paints the camera frame with the tray area outline and the detection badge."""
+    """Camera frame, tray outline, and one labelled box per detected object."""
+    region_clicked = pyqtSignal(int)          # track_id, -1 to clear the selection
 
     def __init__(self):
         super().__init__()
         self.setMinimumSize(320, 240)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.image: Optional[QImage] = None
         self.rec: Optional[Recognition] = None
         self.tray = TrayRegion()
         self.has_items = False
-        self.has_background = False
+        self.active_track = -1
         self.training: Optional[Tuple[int, int]] = None      # (captured, wanted)
         self.caption = ""
+        self.banner = ""
+        self.hint = ""
 
     def set_frame(self, frame: np.ndarray):
         self.image = np_to_qimage(frame)
@@ -392,6 +448,25 @@ class VideoWidget(QWidget):
         self.rec = rec
         self.update()
 
+    # ---- geometry
+    def _map(self) -> Tuple[float, float, float]:
+        iw, ih = self.image.width(), self.image.height()
+        scale = min(self.width() / iw, self.height() / ih)
+        return (self.width() - iw * scale) / 2, (self.height() - ih * scale) / 2, scale
+
+    def mousePressEvent(self, ev):
+        if self.image is None or self.rec is None:
+            return
+        ox, oy, scale = self._map()
+        fx, fy = (ev.position().x() - ox) / scale, (ev.position().y() - oy) / scale
+        for d in self.rec.detections:
+            x, y, w, h = d.box
+            if x <= fx <= x + w and y <= fy <= y + h:
+                self.region_clicked.emit(-1 if self.active_track == d.track_id else d.track_id)
+                return
+        self.region_clicked.emit(-1)
+
+    # ---- paint
     def paintEvent(self, _event):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
@@ -403,75 +478,130 @@ class VideoWidget(QWidget):
             p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, tr("no_camera"))
             return
         iw, ih = self.image.width(), self.image.height()
-        scale = min(self.width() / iw, self.height() / ih)
+        ox, oy, scale = self._map()
         dw, dh = iw * scale, ih * scale
-        ox, oy = (self.width() - dw) / 2, (self.height() - dh) / 2
         p.drawImage(QRectF(ox, oy, dw, dh), self.image)
 
         rec = self.rec
-        accepted = bool(rec and rec.stable_item_id and not rec.empty)
-        empty = bool(rec and rec.empty)
-        if self.training:
-            color = QColor("#ffcc4d")
-        elif accepted:
-            color = QColor("#38d67a")
-        elif empty:
-            color = QColor("#8a94a8")
-        else:
-            color = QColor("#7f8cff")
-        pts = self.tray.pixel_points(iw, ih)
-        poly = [QPointF(ox + x * scale, oy + y * scale) for x, y in pts]
-        if self.tray.is_polygon:
-            p.setPen(QPen(color, 3))
-            for i in range(len(poly)):
-                p.drawLine(poly[i], poly[(i + 1) % len(poly)])
-            p.setBrush(QBrush(color))
-            p.setPen(Qt.PenStyle.NoPen)
-            for pt in poly:
-                p.drawEllipse(pt, 4, 4)
-        else:  # default square: target-style corner brackets
-            x0, y0, x1, y1 = self.tray.bbox(iw, ih)
-            side = (x1 - x0) * scale
-            rx, ry = ox + x0 * scale, oy + y0 * scale
-            L = side * 0.18
-            p.setPen(QPen(color, 4))
-            for (cx, cy, sx, sy) in ((rx, ry, 1, 1), (rx + side, ry, -1, 1), (rx, ry + side, 1, -1), (rx + side, ry + side, -1, -1)):
-                p.drawLine(QPointF(cx, cy), QPointF(cx + sx * L, cy))
-                p.drawLine(QPointF(cx, cy), QPointF(cx, cy + sy * L))
-            p.setPen(QPen(color, 1, Qt.PenStyle.DashLine))
-            p.drawRect(QRectF(rx, ry, side, side))
-
-        # badge
-        if self.training:
-            done, _total = self.training
-            text, badge_color = tr("samples_captured", count=done), QColor(255, 204, 77, 230)
-        elif rec is None:
-            text, badge_color = tr("place_item"), QColor(40, 44, 56, 200)
-        elif empty:
-            text, badge_color = tr("tray_empty"), QColor(70, 76, 92, 220)
-        elif accepted:
-            text, badge_color = f"{rec.stable_name}   {rec.stable_score * 100:.0f}%", QColor(31, 157, 85, 230)
-        elif not self.has_items:
-            text, badge_color = tr("no_items_trained"), QColor(40, 44, 56, 200)
-        else:
-            best = rec.result.ranking[0] if rec.result.ranking else None
-            text = tr("unknown_item") + (f"   ({best[1]} {best[2] * 100:.0f}%)" if best else "")
-            badge_color = QColor(120, 52, 60, 220)
-        p.setFont(QFont("Segoe UI", 15, QFont.Weight.Bold))
-        metrics = p.fontMetrics()
-        text = metrics.elidedText(text, Qt.TextElideMode.ElideRight, int(max(60, dw - 40)))
-        tw, th = metrics.horizontalAdvance(text) + 28, metrics.height() + 16
-        bx, by = ox + (dw - tw) / 2, oy + dh - th - 14
-        p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QBrush(badge_color))
-        p.drawRoundedRect(QRectF(bx, by, tw, th), 10, 10)
-        p.setPen(QColor("white"))
-        p.drawText(QRectF(bx, by, tw, th), Qt.AlignmentFlag.AlignCenter, text)
+        alert = bool(rec and (rec.intrusion or rec.unreliable))
+        self._paint_tray(p, iw, ih, ox, oy, scale, rec, alert)
+        if rec is not None and not self.training:
+            for d in rec.detections:
+                self._paint_region(p, d, ox, oy, scale, dw)
+        if alert:
+            p.fillRect(QRectF(ox, oy, dw, dh), QColor(255, 204, 77, 40))
+        self._paint_badge(p, rec, ox, oy, dw, dh, alert)
         if self.caption:
             p.setFont(QFont("Segoe UI", 9))
             p.setPen(QColor(230, 230, 230, 200))
             p.drawText(QRectF(ox + 8, oy + 6, dw - 16, 20), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, self.caption)
+        if self.hint:
+            p.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
+            p.setPen(QColor("#ffcc4d"))
+            p.drawText(QRectF(ox + 8, oy + 24, dw - 16, 22), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, self.hint)
         p.end()
+
+    def _paint_tray(self, p, iw, ih, ox, oy, scale, rec, alert):
+        if self.training:
+            colour = QColor("#ffcc4d")
+        elif alert:
+            colour = QColor(COL_BAD)
+        elif rec is not None and rec.empty:
+            colour = QColor(COL_EMPTY)
+        elif rec is not None and rec.accepted:
+            colour = QColor(COL_OK)
+        else:
+            colour = QColor(COL_UNKNOWN)
+        pts = self.tray.pixel_points(iw, ih)
+        poly = [QPointF(ox + x * scale, oy + y * scale) for x, y in pts]
+        if self.tray.is_polygon:
+            p.setPen(QPen(colour, 3))
+            for i in range(len(poly)):
+                p.drawLine(poly[i], poly[(i + 1) % len(poly)])
+            p.setBrush(QBrush(colour))
+            p.setPen(Qt.PenStyle.NoPen)
+            for pt in poly:
+                p.drawEllipse(pt, 4, 4)
+        else:
+            x0, y0, x1, y1 = self.tray.bbox(iw, ih)
+            side = (x1 - x0) * scale
+            rx, ry = ox + x0 * scale, oy + y0 * scale
+            L = side * 0.18
+            p.setPen(QPen(colour, 4))
+            for (cx, cy, sx, sy) in ((rx, ry, 1, 1), (rx + side, ry, -1, 1), (rx, ry + side, 1, -1), (rx + side, ry + side, -1, -1)):
+                p.drawLine(QPointF(cx, cy), QPointF(cx + sx * L, cy))
+                p.drawLine(QPointF(cx, cy), QPointF(cx, cy + sy * L))
+            p.setPen(QPen(colour, 1, Qt.PenStyle.DashLine))
+            p.drawRect(QRectF(rx, ry, side, side))
+
+    def _paint_region(self, p, d: Detection, ox, oy, scale, dw):
+        if d.region is None:
+            return                       # whole-tray fallback: the outline already shows it
+        x, y, w, h = d.box
+        r = QRectF(ox + x * scale, oy + y * scale, w * scale, h * scale)
+        if not d.confirmed:
+            colour = QColor(COL_PENDING)
+        elif d.accepted:
+            colour = QColor(COL_OK)
+        else:
+            colour = QColor(COL_UNKNOWN)
+        active = d.track_id == self.active_track
+        style = Qt.PenStyle.DashLine if d.split else Qt.PenStyle.SolidLine
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.setPen(QPen(colour, 4 if active else 2, style))
+        p.drawRoundedRect(r, 6, 6)
+        label = f"{d.name}  {d.score * 100:.0f}%" if d.accepted else tr("unknown_item")
+        p.setFont(QFont("Segoe UI", 11, QFont.Weight.Bold))
+        fm = p.fontMetrics()
+        label = fm.elidedText(label, Qt.TextElideMode.ElideRight, int(max(48, r.width() + 60)))
+        tw, th = fm.horizontalAdvance(label) + 12, fm.height() + 6
+        ty = r.top() - th - 3
+        if ty < oy:
+            ty = r.top() + 3
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QBrush(QColor(colour.red(), colour.green(), colour.blue(), 235)))
+        p.drawRoundedRect(QRectF(r.left(), ty, tw, th), 5, 5)
+        p.setPen(QColor("#0b0d11") if d.accepted else QColor("white"))
+        p.drawText(QRectF(r.left(), ty, tw, th), Qt.AlignmentFlag.AlignCenter, label)
+
+    def _paint_badge(self, p, rec, ox, oy, dw, dh, alert):
+        if self.training:
+            done, _total = self.training
+            text, colour = tr("samples_captured", count=done), QColor(255, 204, 77, 230)
+        elif self.banner:
+            text, colour = self.banner, QColor(161, 52, 62, 235)
+        elif rec is None:
+            text, colour = tr("place_item"), QColor(40, 44, 56, 200)
+        elif rec.intrusion:
+            text, colour = tr("hand_detected"), QColor(161, 52, 62, 235)
+        elif rec.unreliable:
+            text, colour = tr("lighting_changed"), QColor(138, 109, 31, 235)
+        elif rec.empty:
+            text, colour = tr("tray_empty"), QColor(70, 76, 92, 220)
+        elif not self.has_items:
+            text, colour = tr("no_items_trained"), QColor(40, 44, 56, 200)
+        else:
+            acc = rec.accepted
+            names = sorted({d.name for d in acc})
+            if len(acc) > 1 and len(names) == 1:
+                text, colour = tr("same_item_qty", count=len(acc), name=names[0]), QColor(31, 157, 85, 230)
+            elif len(names) > 1:
+                text, colour = " + ".join(names), QColor(138, 109, 31, 235)
+            elif acc:
+                d = acc[0]
+                text, colour = f"{d.name}   {d.score * 100:.0f}%", QColor(31, 157, 85, 230)
+            else:
+                text, colour = tr("unknown_item"), QColor(120, 52, 60, 220)
+        p.setFont(QFont("Segoe UI", 15, QFont.Weight.Bold))
+        fm = p.fontMetrics()
+        text = fm.elidedText(text, Qt.TextElideMode.ElideRight, int(max(60, dw - 40)))
+        tw, th = fm.horizontalAdvance(text) + 28, fm.height() + 16
+        bx, by = ox + (dw - tw) / 2, oy + dh - th - 14
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QBrush(colour))
+        p.drawRoundedRect(QRectF(bx, by, tw, th), 10, 10)
+        p.setPen(QColor("white"))
+        p.drawText(QRectF(bx, by, tw, th), Qt.AlignmentFlag.AlignCenter, text)
 
 
 # ------------------------------------------------------------ tray calibration
@@ -576,7 +706,7 @@ class TrayCanvas(QWidget):
         ih = self.image.height() if self.image else 480
         region = TrayRegion(self.points, True, self.roi_ratio)
         pts = [self._to_widget((x / max(1, iw - 1), y / max(1, ih - 1))) for x, y in region.pixel_points(iw, ih)]
-        color = QColor("#38d67a") if region.is_polygon else QColor("#7f8cff")
+        colour = QColor(COL_OK) if region.is_polygon else QColor(COL_UNKNOWN)
         if region.is_polygon:
             outer = QPainterPath()
             outer.addRect(r)
@@ -584,7 +714,7 @@ class TrayCanvas(QWidget):
             inner.addPolygon(QPolygonF(pts))
             inner.closeSubpath()
             p.fillPath(outer.subtracted(inner), QBrush(QColor(0, 0, 0, 110)))
-        p.setPen(QPen(color, 3, Qt.PenStyle.SolidLine if region.is_polygon else Qt.PenStyle.DashLine))
+        p.setPen(QPen(colour, 3, Qt.PenStyle.SolidLine if region.is_polygon else Qt.PenStyle.DashLine))
         for i in range(len(pts)):
             p.drawLine(pts[i], pts[(i + 1) % len(pts)])
         if self.points:
@@ -693,7 +823,13 @@ class TrayCalibrationDialog(QDialog):
 
 # ------------------------------------------------------------ training dialog
 class TrainDialog(QDialog):
-    """Enrol a new item or add angle samples: one sample per button press (or auto)."""
+    """Enrol a new item or add angle samples: one sample per button press.
+
+    Every press stores its own capture group, which is what makes the per-item
+    threshold calibration possible.  Capture count is the single biggest driver
+    of accuracy measured (hard-set top-1 0.41 at one capture, 0.69 at six), so
+    the dialog nags for six rather than three.
+    """
 
     def __init__(self, parent: "MainWindow", existing: Optional[Item] = None):
         super().__init__(parent)
@@ -701,10 +837,12 @@ class TrainDialog(QDialog):
         self.engine, self.db, self.bus, self.settings = parent.engine, parent.db, parent.bus, parent.settings
         self.existing = existing
         self.setWindowTitle(tr("add_angle_sample") if existing else tr("train_new_item"))
-        self.resize(900, 580)
+        self.resize(920, 600)
         self.samples: List[Tuple[np.ndarray, bytes]] = []        # (embeddings, thumbnail jpeg)
         self._pending: Dict[str, bytes] = {}
         self.min_samples = int(self.settings.get("ai.min_train_samples", 3))
+        self.good_samples = int(self.settings.get("ai.good_train_samples", 6))
+        self.crop_mode = MODE_TRAY
 
         left = QVBoxLayout()
         left.addWidget(QLabel(tr("model_view")))
@@ -712,6 +850,10 @@ class TrainDialog(QDialog):
         self.preview.setFixedSize(300, 300)
         self.preview.setStyleSheet("background:#1b1f27;border:2px solid #2c3340;border-radius:8px")
         self.preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.mode_lbl = QLabel("")
+        self.mode_lbl.setWordWrap(True)
+        self.mode_lbl.setMaximumWidth(300)
+        self.mode_lbl.setStyleSheet("color:#9aa3b5;font-size:13px")
         self.capture_btn = QPushButton(tr("capture_sample"))
         self.capture_btn.setObjectName("primary")
         self.capture_btn.setMinimumHeight(64)
@@ -722,6 +864,7 @@ class TrainDialog(QDialog):
         hint.setMaximumWidth(300)
         hint.setStyleSheet("color:#9aa3b5")
         left.addWidget(self.preview)
+        left.addWidget(self.mode_lbl)
         left.addWidget(self.capture_btn)
         left.addWidget(self.auto_cb)
         left.addWidget(hint)
@@ -764,6 +907,7 @@ class TrainDialog(QDialog):
         right.addWidget(self.del_btn)
         self.need_lbl = QLabel(tr("need_samples", min=self.min_samples))
         self.need_lbl.setStyleSheet("color:#ffcc4d")
+        self.need_lbl.setWordWrap(True)
         right.addWidget(self.need_lbl)
         btns = QHBoxLayout()
         self.save_btn = QPushButton(tr("save_item"))
@@ -785,11 +929,11 @@ class TrainDialog(QDialog):
         QShortcut(QKeySequence(Qt.Key.Key_Space), self, activated=self.capture)
         self.preview_timer = QTimer(self)
         self.preview_timer.timeout.connect(self._refresh_preview)
-        self.preview_timer.start(120)
+        self.preview_timer.start(150)
         self.auto_timer = QTimer(self)
         self.auto_timer.timeout.connect(self._auto_tick)
         self.auto_timer.start(int(self.settings.get("ai.auto_capture_interval_ms", 700)))
-        self.win.video.training = (0, self.min_samples)
+        self.win.video.training = (0, self.good_samples)
 
     def _sync_existing(self, *_args):
         item = self.db.get(self.item_combo.currentData())
@@ -798,33 +942,48 @@ class TrainDialog(QDialog):
             self.price_spin.setValue(item.price_per_kg)
 
     def _refresh_preview(self):
-        crop_box = self.engine.current_crop()
-        if crop_box is not None:
-            self.preview.setPixmap(np_to_pixmap(crop_box[0], 296))
+        sample = self.engine.current_sample()
+        if sample is None:
+            return
+        crop, mode, _seg = sample
+        self.preview.setPixmap(np_to_pixmap(crop, 296))
+        if not self.samples:
+            self.crop_mode = mode
+        self.mode_lbl.setText(tr("object_mode_note") if self.crop_mode == MODE_OBJECT else tr("tray_mode_note"))
 
     def _auto_tick(self):
         if self.auto_cb.isChecked() and self.isVisible():
             self.capture(auto=True)
 
-    def _tray_looks_empty(self) -> bool:
-        rec = self.win.current_rec
-        return bool(rec and rec.empty and (time.time() - rec.result.timestamp) < 3.0)
-
     def capture(self, auto: bool = False):
-        crop_box = self.engine.current_crop()
-        if crop_box is None:
+        sample = self.engine.current_sample()
+        if sample is None:
             if not auto:
                 msg_error(self, tr("no_frame"))
             return
-        if self._tray_looks_empty():
-            if auto:
-                return                                   # auto mode silently skips empty-tray frames
-            if not ask(self, tr("training_blocked_empty")):
+        crop, mode, seg = sample
+        # a frame with a hand or two products in it teaches the model the wrong thing
+        if seg is not None:
+            if seg.intrusion:
+                if not auto:
+                    msg_error(self, tr("capture_blocked_hand"))
                 return
-        crop, _ = crop_box
+            if len([r for r in seg.regions if r.confirmed]) > 1:
+                if not auto:
+                    msg_error(self, tr("capture_blocked_multi"))
+                return
+            if not seg.regions and self.win.tray_looks_empty():
+                if auto or not ask(self, tr("training_blocked_empty")):
+                    return
+        elif self.win.tray_looks_empty():
+            if auto or not ask(self, tr("training_blocked_empty")):
+                return
+        if self.samples and mode != self.crop_mode:
+            mode = self.crop_mode          # never mix crop styles inside one item
         thumb = make_thumbnail(crop, 96) or b""
         token = uuid.uuid4().hex
         self._pending[token] = thumb
+        self.crop_mode = mode if not self.samples else self.crop_mode
         augment = bool(self.settings.get("ai.augment_samples", True))
         self.engine.request_embedding(crop, lambda emb, t=token: self.bus.embedding_ready.emit(t, emb), augment)
         self.capture_btn.setEnabled(False)
@@ -833,7 +992,7 @@ class TrainDialog(QDialog):
     def on_embedding(self, token: str, embeddings: np.ndarray):
         thumb = self._pending.pop(token, None)
         if thumb is None:
-            return                            # not ours (e.g. empty-tray capture)
+            return                            # not ours (empty-tray or reinforcement capture)
         self.samples.append((embeddings, thumb))
         self.list.addItem(QListWidgetItem(icon_from_jpeg(thumb) or QIcon(), str(len(self.samples))))
         self._update_counts()
@@ -852,8 +1011,15 @@ class TrainDialog(QDialog):
         n = len(self.samples)
         self.count_lbl.setText(tr("samples_captured", count=n))
         self.save_btn.setEnabled(n > 0)
-        self.need_lbl.setVisible(n < self.min_samples)
-        self.win.video.training = (n, self.min_samples)
+        if n < self.min_samples:
+            self.need_lbl.setText(tr("need_samples", min=self.min_samples))
+            self.need_lbl.setVisible(True)
+        elif n < self.good_samples:
+            self.need_lbl.setText(tr("capture_more_views", done=n, want=self.good_samples))
+            self.need_lbl.setVisible(True)
+        else:
+            self.need_lbl.setVisible(False)
+        self.win.video.training = (n, self.good_samples)
 
     def save(self):
         name = self.name_edit.text().strip()
@@ -869,6 +1035,7 @@ class TrainDialog(QDialog):
         if len(self.samples) < self.min_samples and not ask(self, tr("few_samples_confirm", count=len(self.samples))):
             return
         embeddings = np.vstack([e for e, _ in self.samples])
+        groups = np.concatenate([np.full(len(e), i, np.int32) for i, (e, _) in enumerate(self.samples)])
         thumb = self.samples[0][1] or None
         item_id = self.item_combo.currentData() if self.existing is not None else None
         if item_id is None:
@@ -877,11 +1044,11 @@ class TrainDialog(QDialog):
                 item_id = dup.id                     # same name -> add samples instead of a duplicate item
         try:
             if item_id and self.db.get(item_id):
-                item = self.db.add_samples(item_id, embeddings, thumb)
+                item = self.db.add_samples(item_id, embeddings, thumb, groups, self.crop_mode)
                 if self.existing is None:
                     self.db.update_item(item_id, price_per_kg=price)
             else:
-                item = self.db.add_item(name, price, embeddings, thumb)
+                item = self.db.add_item(name, price, embeddings, thumb, groups, self.crop_mode)
             self.db.save()
             self.engine.reset_smoothing()
         except Exception as exc:
@@ -907,15 +1074,20 @@ class ManageItemsDialog(QDialog):
         super().__init__(parent)
         self.db, self.settings = db, settings
         self.setWindowTitle(tr("manage_items"))
-        self.resize(720, 460)
-        self.table = QTableWidget(0, 4)
-        self.table.setHorizontalHeaderLabels([tr("name"), tr("price_per_kg"), tr("samples"), tr("delete")])
+        self.resize(880, 500)
+        self.table = QTableWidget(0, 6)
+        self.table.setHorizontalHeaderLabels([tr("name"), tr("price_per_kg"), tr("samples"), tr("mode_column"),
+                                              tr("learned"), tr("delete")])
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         self.table.verticalHeader().setVisible(False)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         lay = QVBoxLayout(self)
         self.count_label = QLabel()
         lay.addWidget(self.count_label)
+        self.warn_label = QLabel()
+        self.warn_label.setWordWrap(True)
+        self.warn_label.setStyleSheet("color:#ffcc4d")
+        lay.addWidget(self.warn_label)
         lay.addWidget(self.table)
         box = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
         box.rejected.connect(self.accept)
@@ -935,15 +1107,32 @@ class ManageItemsDialog(QDialog):
                 name_item.setIcon(icon)
             self.table.setItem(r, 0, name_item)
             self.table.setItem(r, 1, QTableWidgetItem(f"{it.price_per_kg:g}"))
-            cnt = QTableWidgetItem(str(it.sample_count))
+            cnt = QTableWidgetItem(f"{it.capture_count} ({it.sample_count})")
             cnt.setFlags(cnt.flags() & ~Qt.ItemFlag.ItemIsEditable)
             self.table.setItem(r, 2, cnt)
+            mode = QTableWidgetItem("object" if it.crop_mode == MODE_OBJECT else "tray")
+            mode.setFlags(mode.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            if it.crop_mode != MODE_OBJECT:
+                mode.setToolTip(tr("retrain_needed"))
+                mode.setForeground(QColor("#ffcc4d"))
+            self.table.setItem(r, 3, mode)
+            if it.drift_count:
+                btn = QPushButton(f"{it.drift_count}  {tr('forget_learned')}")
+                btn.clicked.connect(lambda _=False, iid=it.id: self.forget(iid))
+                self.table.setCellWidget(r, 4, btn)
+            else:
+                empty = QTableWidgetItem("0")
+                empty.setFlags(empty.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                self.table.setItem(r, 4, empty)
             btn = QPushButton(tr("delete"))
             btn.setObjectName("danger")
             btn.clicked.connect(lambda _=False, iid=it.id, nm=it.name: self.delete(iid, nm))
-            self.table.setCellWidget(r, 3, btn)
+            self.table.setCellWidget(r, 5, btn)
         self.table.blockSignals(False)
         self.count_label.setText(tr("items_count", count=len(items)))
+        pairs = self.db.confusable_pairs(5)
+        self.warn_label.setText(tr("confusable_items", pairs=", ".join(f"{a} / {b}" for a, b, _ in pairs)) if pairs else "")
+        self.warn_label.setVisible(bool(pairs))
 
     def on_changed(self, cell: QTableWidgetItem):
         row = cell.row()
@@ -958,6 +1147,11 @@ class ManageItemsDialog(QDialog):
             msg_error(self, str(exc))
             self.reload()
 
+    def forget(self, iid: str):
+        self.db.forget_drift(iid)
+        self.db.save()
+        self.reload()
+
     def delete(self, iid: str, name: str):
         if ask(self, tr("delete_item_confirm", name=name)):
             self.db.delete_item(iid)
@@ -971,7 +1165,7 @@ class SettingsDialog(QDialog):
         super().__init__(parent)
         self.settings, self.printer_factory, self.bus = settings, printer_factory, bus
         self.setWindowTitle(tr("settings"))
-        self.resize(840, 700)
+        self.resize(860, 720)
         self._monitor: Optional[ScaleReader] = None
         self._suggestion: Optional[dict] = None
         self._diag_running = False
@@ -999,6 +1193,12 @@ class SettingsDialog(QDialog):
             self.diag_btn.setEnabled(True)
             self.apply_btn.setEnabled(self._suggestion is not None)
             self._append_scale(("PROBLEM: " if is_error else "OK: ") + text)
+            # The bug this fixes: a diagnosis that succeeds returns no "suggestion",
+            # so the only code that ever unticked simulation was unreachable exactly
+            # when the hardware worked first time.
+            if not is_error and self.simulate.isChecked():
+                self.simulate.setChecked(False)
+                self._append_scale("-> " + tr("sim_unticked"))
         elif kind == "print":
             (msg_error if is_error else msg_info)(self, text)
 
@@ -1014,7 +1214,7 @@ class SettingsDialog(QDialog):
     def _general_tab(self):
         w = QWidget()
         f = QFormLayout(w)
-        g = self.settings.section("general")
+        g, pos = self.settings.section("general"), self.settings.section("pos")
         self.lang = QComboBox()
         self.lang.addItem("فارسی (Persian)", "fa")
         self.lang.addItem("English", "en")
@@ -1026,11 +1226,24 @@ class SettingsDialog(QDialog):
         self.cur_dec.setValue(int(g["currency_decimals"]))
         self.auto_add = QCheckBox(tr("auto_add"))
         self.auto_add.setChecked(bool(g.get("auto_add", False)))
+        self.multi_mode = QComboBox()
+        for key in ("interlock", "quantity", "off"):
+            self.multi_mode.addItem(tr(f"mode_{key}"), key)
+        keys = ["interlock", "quantity", "off"]
+        cur = pos.get("multi_item_mode", "interlock")
+        self.multi_mode.setCurrentIndex(keys.index(cur) if cur in keys else 0)
+        self.refuse_hand = QCheckBox(tr("hand_detected"))
+        self.refuse_hand.setChecked(bool(pos.get("refuse_on_intrusion", True)))
+        self.reinforce = QCheckBox(tr("learn_manual"))
+        self.reinforce.setChecked(bool(pos.get("reinforce_on_manual_pick", True)))
         f.addRow(tr("language"), self.lang)
         f.addRow(tr("store_name"), self.store)
         f.addRow(tr("currency"), self.currency)
         f.addRow(tr("currency_decimals"), self.cur_dec)
         f.addRow("", self.auto_add)
+        f.addRow(tr("multi_item_mode"), self.multi_mode)
+        f.addRow("", self.refuse_hand)
+        f.addRow("", self.reinforce)
         return w
 
     # -- camera & AI
@@ -1061,16 +1274,16 @@ class SettingsDialog(QDialog):
             self.rotate.addItem(f"{r}°", r)
         rot = int(c.get("rotate", 0))
         self.rotate.setCurrentIndex((0, 90, 180, 270).index(rot) if rot in (0, 90, 180, 270) else 0)
+        self.per_object = QCheckBox(tr("per_object_recognition"))
+        self.per_object.setChecked(bool(a.get("per_object_recognition", True)))
+        self.max_objects = QSpinBox()
+        self.max_objects.setRange(1, 8)
+        self.max_objects.setValue(int(a.get("max_objects", 5)))
         self.thr = QSlider(Qt.Orientation.Horizontal)
         self.thr.setRange(30, 95)
         self.thr.setValue(int(float(a["confidence_threshold"]) * 100))
         self.thr_lbl = QLabel(f"{self.thr.value() / 100:.2f}")
         self.thr.valueChanged.connect(lambda v: self.thr_lbl.setText(f"{v / 100:.2f}"))
-        self.empty_thr = QSlider(Qt.Orientation.Horizontal)
-        self.empty_thr.setRange(70, 98)
-        self.empty_thr.setValue(int(float(a.get("empty_threshold", 0.88)) * 100))
-        self.empty_lbl = QLabel(f"{self.empty_thr.value() / 100:.2f}")
-        self.empty_thr.valueChanged.connect(lambda v: self.empty_lbl.setText(f"{v / 100:.2f}"))
         self.smooth = QSpinBox()
         self.smooth.setRange(1, 15)
         self.smooth.setValue(int(a["smoothing_frames"]))
@@ -1091,10 +1304,10 @@ class SettingsDialog(QDialog):
         f.addRow(tr("resolution"), self.resolution)
         f.addRow("", self.mirror)
         f.addRow(tr("rotate"), self.rotate)
+        f.addRow("", self.per_object)
+        f.addRow(tr("max_objects"), self.max_objects)
         row = QHBoxLayout(); row.addWidget(self.thr); row.addWidget(self.thr_lbl)
         f.addRow(tr("threshold"), row)
-        row = QHBoxLayout(); row.addWidget(self.empty_thr); row.addWidget(self.empty_lbl)
-        f.addRow(tr("empty_threshold"), row)
         f.addRow(tr("smoothing"), self.smooth)
         f.addRow(tr("train_samples"), self.min_samples)
         f.addRow("", self.motion_gate)
@@ -1192,7 +1405,7 @@ class SettingsDialog(QDialog):
         self.port.clear()
         for dev, desc in list_serial_ports():
             self.port.addItem(dev, dev)
-            self.port.setItemData(self.port.count() - 1, f"{dev} – {desc}", Qt.ItemDataRole.ToolTipRole)
+            self.port.setItemData(self.port.count() - 1, f"{dev} - {desc}", Qt.ItemDataRole.ToolTipRole)
         self.port.setCurrentText(cur)
 
     def _scale_config(self) -> dict:
@@ -1240,6 +1453,8 @@ class SettingsDialog(QDialog):
         elif h["bytes"] == 0:
             self._append_scale("port open, waiting for data ... (nothing received yet)")
             QTimer.singleShot(3000, self._monitor_status)
+        elif h.get("unstable"):
+            self._append_scale(f"note: {h['unstable']} of {h['readings']} readings are flagged unstable (motion)")
 
     def _stop_monitor(self):
         if self._monitor is not None:
@@ -1269,7 +1484,8 @@ class SettingsDialog(QDialog):
             except Exception as exc:
                 self.bus.dialog_result.emit("scale_done", str(exc), True)
 
-        threading.Thread(target=work, daemon=True).start()
+        self._diag_thread = threading.Thread(target=work, daemon=True)
+        self._diag_thread.start()
 
     def _apply_suggestion(self):
         sug = self._suggestion or {}
@@ -1376,6 +1592,9 @@ class SettingsDialog(QDialog):
         s.update_section("general", {"language": self.lang.currentData(), "store_name": self.store.text().strip(),
                                      "currency": self.currency.text().strip(), "currency_decimals": self.cur_dec.value(),
                                      "auto_add": self.auto_add.isChecked()})
+        s.update_section("pos", {"multi_item_mode": self.multi_mode.currentData(),
+                                 "refuse_on_intrusion": self.refuse_hand.isChecked(),
+                                 "reinforce_on_manual_pick": self.reinforce.isChecked()})
         try:
             w, h = [int(x) for x in self.resolution.currentText().lower().replace("×", "x").split("x")]
         except Exception:
@@ -1383,9 +1602,11 @@ class SettingsDialog(QDialog):
         s.update_section("camera", {"backend": self.backend.currentData(), "device_index": self.dev_index.value(),
                                     "width": w, "height": h, "mirror": self.mirror.isChecked(),
                                     "rotate": self.rotate.currentData(), "video_file": self.video.text().strip()})
-        s.update_section("ai", {"confidence_threshold": self.thr.value() / 100.0, "empty_threshold": self.empty_thr.value() / 100.0,
+        s.update_section("ai", {"confidence_threshold": self.thr.value() / 100.0,
                                 "smoothing_frames": self.smooth.value(), "min_train_samples": self.min_samples.value(),
-                                "motion_gate": self.motion_gate.isChecked()})
+                                "motion_gate": self.motion_gate.isChecked(),
+                                "per_object_recognition": self.per_object.isChecked(),
+                                "max_objects": self.max_objects.value()})
         s.update_section("scale", self._scale_config())
         s.update_section("printer", self._printer_config())
         s.save()
@@ -1403,6 +1624,7 @@ class MainWindow(QMainWindow):
         self.resize(1400, 860)
         self.lines: List[InvoiceLine] = []
         self.current_rec: Optional[Recognition] = None
+        self.current_frame: Optional[np.ndarray] = None
         self.current_weight: Optional[WeightReading] = None
         self.camera_thread: Optional[CameraThread] = None
         self.camera_result = None
@@ -1414,9 +1636,12 @@ class MainWindow(QMainWindow):
         self.printer = self._make_printer(settings.section("printer"), settings.section("general"))
         self._auto_armed = True
         self._last_frame_id = -1
+        self._scale_conflict = False
+        self._bg_frames: List[np.ndarray] = []
+        self._bg_payload = None
+        self._bg_thumb: Optional[bytes] = None
         self._bg_pending: List[np.ndarray] = []
         self._bg_wanted = 0
-        self._bg_thumb: Optional[bytes] = None
         self._build_ui()
         self._wire_signals()
         self._shortcuts()
@@ -1447,14 +1672,16 @@ class MainWindow(QMainWindow):
         t.setObjectName("title")
         head.addWidget(t)
         head.addStretch(1)
+        self.objects_pill = QLabel("")
+        self.objects_pill.setStyleSheet(PILL % PILL_NEUTRAL)
+        head.addWidget(self.objects_pill)
         self.cam_pill = QLabel(tr("no_camera"))
-        self.cam_pill.setStyleSheet("padding:3px 10px;border-radius:10px;background:#2a2f3a;font-size:13px")
+        self.cam_pill.setStyleSheet(PILL % PILL_NEUTRAL)
         head.addWidget(self.cam_pill)
         ll.addLayout(head)
         self.video = VideoWidget()
         self.video.tray = self.tray
         self.video.has_items = len(self.db) > 0
-        self.video.has_background = self.db.has_background
         ll.addWidget(self.video, 1)
         self.detected_lbl = QLabel(tr("place_item"))
         self.detected_lbl.setObjectName("detected")
@@ -1508,25 +1735,41 @@ class MainWindow(QMainWindow):
         unit = QLabel(tr("kg"))
         unit.setStyleSheet("font-size:20px;color:#9aa3b5")
         self.scale_pill = QLabel("")
-        self.scale_pill.setStyleSheet("padding:3px 10px;border-radius:10px;background:#2a2f3a;font-size:13px")
+        self.scale_pill.setStyleSheet(PILL % PILL_NEUTRAL)
         self.scale_pill.setWordWrap(True)
         wl.addWidget(self.weight_lbl, 0, 0, 1, 2)
         wl.addWidget(unit, 0, 2)
         wl.addWidget(self.scale_pill, 1, 0, 1, 3, Qt.AlignmentFlag.AlignCenter)
         self.sim_box = QWidget()
-        sl = QHBoxLayout(self.sim_box)
+        sl = QVBoxLayout(self.sim_box)
         sl.setContentsMargins(0, 0, 0, 0)
-        sl.addWidget(QLabel(tr("simulated_weight")))
+        srow = QHBoxLayout()
+        srow.addWidget(QLabel(tr("simulated_weight")))
         self.sim_slider = QSlider(Qt.Orientation.Horizontal)
         self.sim_slider.setRange(0, 4000)          # 0 .. 20.000 kg in 5 g steps
         self.sim_spin = QDoubleSpinBox()
         self.sim_spin.setRange(0, 20)
         self.sim_spin.setDecimals(3)
         self.sim_spin.setSingleStep(0.005)
-        sl.addWidget(self.sim_slider, 1)
-        sl.addWidget(self.sim_spin)
+        srow.addWidget(self.sim_slider, 1)
+        srow.addWidget(self.sim_spin)
+        sl.addLayout(srow)
+        # one click out of "a port is configured but simulation is on", which is
+        # the state that makes the app look like the scale is dead
+        self.use_real_btn = QPushButton(tr("use_real_scale", port=""))
+        self.use_real_btn.setObjectName("primary")
+        self.use_real_btn.setVisible(False)
+        self.use_real_btn.clicked.connect(self._switch_to_real_scale)
+        sl.addWidget(self.use_real_btn)
         wl.addWidget(self.sim_box, 2, 0, 1, 3)
         rl.addWidget(wbox)
+
+        self.banner_lbl = QLabel("")
+        self.banner_lbl.setObjectName("banner")
+        self.banner_lbl.setWordWrap(True)
+        self.banner_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.banner_lbl.setVisible(False)
+        rl.addWidget(self.banner_lbl)
 
         addrow = QHBoxLayout()
         self.add_btn = QPushButton(tr("add_to_invoice"))
@@ -1618,6 +1861,7 @@ class MainWindow(QMainWindow):
         self.bus.toast.connect(self.on_toast)
         self.bus.print_done.connect(self.on_print_done)
         self.bus.embedding_ready.connect(self.on_embedding)
+        self.video.region_clicked.connect(self.on_region_clicked)
         self.train_btn.clicked.connect(self.train_new)
         self.angle_btn.clicked.connect(self.add_angle)
         self.manage_btn.clicked.connect(self.manage_items)
@@ -1702,10 +1946,17 @@ class MainWindow(QMainWindow):
         self.engine = RecognitionEngine(fx, self.db, self._camera_frame, self.tray, float(ai["confidence_threshold"]),
                                         float(ai.get("empty_threshold", 0.88)), float(ai["infer_fps"]),
                                         int(ai["smoothing_frames"]), int(ai.get("top_k", 3)),
-                                        on_result=lambda rec, crop: self.bus.recognition.emit(rec, crop),
+                                        on_result=lambda rec, frame: self.bus.recognition.emit(rec, frame),
                                         motion_gate=bool(ai.get("motion_gate", True)),
-                                        motion_threshold=float(ai.get("motion_threshold", 6.0)))
+                                        motion_threshold=float(ai.get("motion_threshold", 6.0)),
+                                        per_object=bool(ai.get("per_object_recognition", True)),
+                                        max_objects=int(ai.get("max_objects", 5)),
+                                        min_area_frac=float(ai.get("min_area_frac", 0.008)),
+                                        background_refresh=bool(ai.get("background_refresh", True)))
         self.engine.start()
+        self.video.hint = "" if self.engine.has_segmenter else tr("capture_empty_first")
+        if self.db.backbone_mismatch:
+            msg_error(self, tr("retrain_needed"))
         self.status.showMessage(tr("model_ready"), 5000)
 
     def stop_scale(self):
@@ -1717,22 +1968,41 @@ class MainWindow(QMainWindow):
             self.scale = None
 
     def start_scale(self):
+        """Build the scale object the settings describe, and never do it silently.
+
+        The single most confusing state is "a COM port is configured but
+        simulation is still on": the settings dialog tests the port and reports
+        success, while the main screen shows a simulated zero.  It is now amber,
+        spelled out, and one click away from being fixed.
+        """
         self.stop_scale()
         sc = self.settings.section("scale")
-        if sc.get("simulate") or not sc.get("port") or not sc.get("enabled", True):
+        port = (sc.get("port") or "").strip()
+        self._scale_conflict = bool(port) and bool(sc.get("simulate")) and bool(sc.get("enabled", True))
+        if sc.get("simulate") or not port or not sc.get("enabled", True):
             self.scale = SimulatedScale(self.sim_spin.value())
             self.sim_box.setVisible(True)
-            self.scale_pill.setText(f"{tr('scale_status')}: {tr('scale_simulated')}")
-            self.scale_pill.setStyleSheet("padding:3px 10px;border-radius:10px;background:#2a2f3a;font-size:13px")
+            self.use_real_btn.setVisible(self._scale_conflict)
+            self.use_real_btn.setText(tr("use_real_scale", port=port))
+            note = f" ({port}: {tr('scale_sim_overrides_port')})" if self._scale_conflict else ""
+            self.scale_pill.setText(f"{tr('scale_status')}: {tr('scale_simulated')}{note}")
+            self.scale_pill.setStyleSheet(PILL % (PILL_WARN if self._scale_conflict else PILL_NEUTRAL))
             if self.engine:
                 self.engine.set_weight_hint(None)
         else:
             self.scale = ScaleReader(sc)
             self.sim_box.setVisible(False)
+            self.use_real_btn.setVisible(False)
+        self.scale_pill.setToolTip(scale_mode_reason(self.settings))
         self.scale.subscribe(lambda r: self.bus.weight.emit(r))
         self.scale.start()
         if self.scale.is_simulated:
             self.scale.set_weight(self.sim_spin.value())
+
+    def _switch_to_real_scale(self):
+        self.settings.set("scale.simulate", False)
+        self.settings.save()
+        self.start_scale()
 
     def _on_sim_spin(self, value: float):
         self.sim_slider.blockSignals(True)
@@ -1740,6 +2010,8 @@ class MainWindow(QMainWindow):
         self.sim_slider.blockSignals(False)
         if self.scale is not None and self.scale.is_simulated:
             self.scale.set_weight(value)
+            if self.engine:
+                self.engine.set_weight_hint(value < float(self.settings.get("scale.min_weight_kg", 0.005)))
 
     # ----------------------------------------------------------- events
     def _tick(self):
@@ -1749,8 +2021,9 @@ class MainWindow(QMainWindow):
             self.video.set_frame(frame)
         if self.engine is not None:
             rec = self.current_rec
-            extra = f" | bg {rec.empty_score:.2f}" if (rec and self.db.has_background) else ""
-            self.status_ai.setText(f"AI {self.engine.stats_ms:.0f} ms{extra}")
+            n = len(rec.confirmed) if rec else 0
+            seg = f" | seg {self.engine.seg_ms:.0f} ms" if self.engine.has_segmenter else ""
+            self.status_ai.setText(f"AI {self.engine.stats_ms:.0f} ms{seg} | {n} obj")
         if self.scale is not None and not self.scale.is_simulated:
             self._update_scale_status()
 
@@ -1760,83 +2033,157 @@ class MainWindow(QMainWindow):
         reading = self.scale.latest()
         fresh = reading is not None and reading.age <= hold
         if h["status"] == "error":
-            state, color = f"{tr('scale_disconnected')}: {h.get('error', '')}", "#a1343e"
+            state, colour = f"{tr('scale_disconnected')}: {h.get('error', '')}", PILL_BAD
         elif h["status"] == "connecting":
-            state, color = tr("scale_connecting"), "#2a2f3a"
+            state, colour = tr("scale_connecting"), PILL_NEUTRAL
         elif fresh:
-            state = tr("scale_connected") + ("" if reading.stable else f" – {tr('scale_unstable')}")
-            color = "#1f9d55" if reading.stable else "#8a6d1f"
-        elif h.get("bytes", 0) == 0 or (h.get("data_age") is not None and h["data_age"] > 3):
-            state, color = tr("scale_no_data"), "#8a6d1f"
+            state = tr("scale_connected") + ("" if reading.stable else f" - {tr('scale_unstable')}")
+            colour = PILL_OK if reading.stable else PILL_WARN
+        elif h.get("bytes", 0) == 0:
+            state, colour = tr("scale_no_data"), PILL_WARN
+        elif h.get("readings", 0) > 0:
+            # bytes arrived and parsed, they are just old: never blame the data
+            state, colour = tr("scale_stale_data"), PILL_WARN
         else:
-            state, color = tr("scale_bad_data"), "#8a6d1f"
+            state, colour = tr("scale_bad_data"), PILL_WARN
         self.scale_pill.setText(f"{tr('scale_status')}: {state}")
-        self.scale_pill.setStyleSheet(f"padding:3px 10px;border-radius:10px;background:{color};font-size:13px")
+        self.scale_pill.setStyleSheet(PILL % colour)
+        self.scale_pill.setToolTip(scale_mode_reason(self.settings))
         if reading is None or reading.age > hold:
             self.weight_lbl.setText("—")
-            self.weight_lbl.setStyleSheet(WEIGHT_STYLE_STALE)
+            self.weight_lbl.setStyleSheet(WEIGHT_STALE)
             self.current_weight = None
             if self.engine:
                 self.engine.set_weight_hint(None)
         elif reading.age > 2.0:
-            self.weight_lbl.setStyleSheet(WEIGHT_STYLE_STALE)
+            self.weight_lbl.setStyleSheet(WEIGHT_STALE)
 
     def on_weight(self, reading: WeightReading):
         self.current_weight = reading
         self.weight_lbl.setText(fmt_weight(reading.weight_kg, int(self.settings.get("general.weight_decimals", 3))))
-        self.weight_lbl.setStyleSheet(WEIGHT_STYLE_FRESH if reading.stable else WEIGHT_STYLE_UNSTABLE)
+        self.weight_lbl.setStyleSheet(WEIGHT_FRESH if reading.stable else WEIGHT_UNSTABLE)
         min_w = float(self.settings.get("scale.min_weight_kg", 0.005))
         if reading.weight_kg < min_w:
             self._auto_armed = True
-        if self.engine and self.scale is not None and not self.scale.is_simulated:
+        if self.engine:
             self.engine.set_weight_hint(reading.weight_kg < min_w)
         self._maybe_auto_add()
 
-    def on_recognition(self, rec: Recognition, _crop):
+    def on_recognition(self, rec: Recognition, frame):
         self.current_rec = rec
+        self.current_frame = frame
         self.video.set_recognition(rec)
+        if self.engine is not None:
+            self.video.hint = "" if self.engine.has_segmenter else tr("capture_empty_first")
+        n = len(rec.confirmed)
+        self.objects_pill.setText(tr("objects_detected", count=n) if n != 1 else tr("one_object"))
+        self.objects_pill.setStyleSheet(PILL % (PILL_OK if n == 1 else (PILL_WARN if n > 1 else PILL_NEUTRAL)))
+        self._update_blocking()
         if self.video.training is not None:
             return
+        active = self._active_detection()
         if rec.empty:
             self.detected_lbl.setText(tr("tray_empty"))
             self.detected_lbl.setStyleSheet("color:#9aa3b5")
             self.conf_bar.setValue(0)
             self._auto_armed = True
-        elif rec.stable_item_id:
-            self.detected_lbl.setText(rec.stable_name)
+        elif active is not None and active.accepted:
+            self.detected_lbl.setText(active.name)
             self.detected_lbl.setStyleSheet("color:#7CFC9A")
-            self.conf_bar.setValue(int(rec.stable_score * 100))
+            self.conf_bar.setValue(int(active.score * 100))
         else:
             self.detected_lbl.setText(tr("unknown_item") if len(self.db) else tr("no_items_trained"))
             self.detected_lbl.setStyleSheet("color:#ffb4b4" if len(self.db) else "color:#9aa3b5")
-            self.conf_bar.setValue(int(rec.result.score * 100) if rec.result.ranking else 0)
+            self.conf_bar.setValue(int(active.result.score * 100) if active is not None else 0)
         self._maybe_auto_add()
+
+    def on_region_clicked(self, track_id: int):
+        self.video.active_track = track_id
+        self.video.update()
+        if self.current_rec is not None:
+            self.on_recognition(self.current_rec, self.current_frame)
 
     def on_toast(self, text: str, is_error: bool):
         self.status.showMessage(text, 8000)
         if is_error:
             msg_error(self, text)
 
-    # ------------------------------------------------------ invoice ops
+    # ------------------------------------------------------ POS decisions
+    def _active_detection(self) -> Optional[Detection]:
+        rec = self.current_rec
+        if rec is None:
+            return None
+        if self.video.active_track >= 0:
+            for d in rec.detections:
+                if d.track_id == self.video.active_track:
+                    return d
+        return rec.primary
+
+    def tray_looks_empty(self) -> bool:
+        rec = self.current_rec
+        return bool(rec and rec.empty)
+
+    def blocking_reason(self) -> Optional[str]:
+        """Why the invoice must not be priced right now.
+
+        The scale reports ONE number for everything on the tray.  Splitting it
+        between products by pixel area was measured to be more than 20% wrong on
+        half of all lines, so this refuses instead of guessing.
+        """
+        rec = self.current_rec
+        mode = self.settings.get("pos.multi_item_mode", "interlock")
+        if mode == "off" or rec is None:
+            return None
+        if rec.intrusion and self.settings.get("pos.refuse_on_intrusion", True):
+            return tr("hand_detected")
+        if rec.unreliable and self.settings.get("pos.refuse_on_unreliable", True):
+            return tr("lighting_changed")
+        if len(rec.distinct_items) > 1:
+            return tr("multi_item_block")
+        return None
+
+    def _update_blocking(self):
+        reason = self.blocking_reason()
+        self.banner_lbl.setText(reason or "")
+        self.banner_lbl.setVisible(bool(reason))
+        self.add_btn.setEnabled(reason is None)
+        self.video.banner = reason if reason and reason == tr("multi_item_block") else ""
+
     def _weight_ok(self) -> Optional[float]:
-        w = self.current_weight.weight_kg if self.current_weight else 0.0
+        r = self.current_weight
+        if r is not None and not r.stable and bool(self.settings.get("scale.stable_only", False)):
+            self.status.showMessage(tr("weight_unstable"), 4000)
+            return None
+        w = r.weight_kg if r else 0.0
         if w < float(self.settings.get("scale.min_weight_kg", 0.005)):
             self.status.showMessage(tr("zero_weight"), 4000)
             return None
         return w
 
     def add_detected(self):
+        reason = self.blocking_reason()
+        if reason:
+            self.status.showMessage(reason, 5000)
+            return
         rec = self.current_rec
-        if rec is None or not rec.stable_item_id or rec.empty:
+        active = self._active_detection()
+        if rec is None or active is None or not active.accepted or rec.empty:
             self.status.showMessage(tr("no_item_detected"), 4000)
             return
-        item = self.db.get(rec.stable_item_id)
+        item = self.db.get(active.item_id)
         if item is None:
             return
         w = self._weight_ok()
         if w is None:
             return
-        self._add_line(item, w, rec.stable_score)
+        qty = 1
+        if self.settings.get("pos.multi_item_mode", "interlock") == "quantity":
+            same = [d for d in rec.accepted if d.item_id == active.item_id]
+            # a count is only trustworthy for clearly separated objects: touching
+            # items merge or split unpredictably (measured 28-70% recall)
+            if len(same) > 1 and not any(d.split for d in same):
+                qty = len(same)
+        self._add_line(item, w, active.score, qty)
 
     def add_manual(self):
         iid = self.manual_combo.currentData()
@@ -1847,26 +2194,56 @@ class MainWindow(QMainWindow):
         w = self._weight_ok()
         if w is None:
             return
+        self._reinforce(item)
         self._add_line(item, w, 0.0)
+
+    def _reinforce(self, item: Item):
+        """Teach the model today's lighting from an operator-confirmed pick.
+
+        Only ever from a manual pick: letting the model add its own confident
+        predictions was measured to collapse accuracy by 14 points.
+        """
+        if not self.settings.get("pos.reinforce_on_manual_pick", True) or self.engine is None:
+            return
+        cap = int(self.settings.get("ai.drift_cap", 5))
+        if cap <= 0 or self.current_frame is None:
+            return
+        active = self._active_detection()
+        try:
+            if active is not None and active.region is not None and item.crop_mode == MODE_OBJECT:
+                crop = region_crop(self.current_frame, active.region)
+            elif item.crop_mode == MODE_TRAY:
+                crop, _ = self.tray.crop(self.current_frame)
+            else:
+                return
+        except Exception:
+            return
+        self.engine.request_embedding(crop, lambda e, iid=item.id: self.bus.embedding_ready.emit(f"reinforce:{iid}", e), False)
 
     def _maybe_auto_add(self):
         if not self.settings.get("general.auto_add", False) or not self._auto_armed:
             return
-        rec, reading = self.current_rec, self.current_weight
-        if rec is None or reading is None or rec.empty or not rec.stable_item_id or not reading.stable:
+        if self.blocking_reason():
             return
-        if rec.stable_score < float(self.settings.get("general.auto_add_min_confidence", 0.8)):
+        rec, reading = self.current_rec, self.current_weight
+        if rec is None or reading is None or rec.empty or not reading.stable:
+            return
+        active = self._active_detection()
+        if active is None or not active.accepted:
+            return
+        if active.score < float(self.settings.get("general.auto_add_min_confidence", 0.8)):
             return
         if reading.weight_kg < float(self.settings.get("scale.min_weight_kg", 0.005)):
             return
-        item = self.db.get(rec.stable_item_id)
+        item = self.db.get(active.item_id)
         if item is None:
             return
         self._auto_armed = False          # re-armed when the tray is emptied
-        self._add_line(item, reading.weight_kg, rec.stable_score)
+        self._add_line(item, reading.weight_kg, active.score)
 
-    def _add_line(self, item: Item, weight: float, conf: float):
-        self.lines.append(InvoiceLine(item.name, weight, item.price_per_kg, item.id, conf))
+    def _add_line(self, item: Item, weight: float, conf: float, quantity: int = 1):
+        self.lines.append(InvoiceLine(item.name, weight, item.price_per_kg, item.id, conf, quantity,
+                                      item.unit, item.price_per_piece))
         self._refresh_table()
         self.table.selectRow(self.table.rowCount() - 1)
 
@@ -1875,7 +2252,9 @@ class MainWindow(QMainWindow):
         w_dec = int(self.settings.get("general.weight_decimals", 3))
         self.table.setRowCount(len(self.lines))
         for r, ln in enumerate(self.lines):
-            cells = [ln.name, fmt_weight(ln.weight_kg, w_dec), fmt_money(ln.price_per_kg, cur_dec), fmt_money(ln.total, cur_dec)]
+            unit_price = ln.price_per_piece if ln.unit == "pcs" else ln.price_per_kg
+            cells = [ln.display_name, fmt_weight(ln.weight_kg, w_dec), fmt_money(unit_price, cur_dec),
+                     fmt_money(ln.total, cur_dec)]
             for c, text in enumerate(cells):
                 it = QTableWidgetItem(text)
                 if c:
@@ -1986,8 +2365,9 @@ class MainWindow(QMainWindow):
         if not items:
             msg_info(self, tr("no_items_trained"))
             return
-        current = self.db.get(self.current_rec.stable_item_id) if (self.current_rec and self.current_rec.stable_item_id) else items[0]
-        dlg = TrainDialog(self, existing=current)
+        active = self._active_detection()
+        current = self.db.get(active.item_id) if (active and active.item_id) else items[0]
+        dlg = TrainDialog(self, existing=current or items[0])
         dlg.exec()
         dlg.deleteLater()
         self._refresh_items_ui()
@@ -2006,7 +2386,6 @@ class MainWindow(QMainWindow):
                 self.manual_combo.addItem(it.name, it.id)
         self.status_items.setText(tr("items_count", count=len(self.db)))
         self.video.has_items = len(self.db) > 0
-        self.video.has_background = self.db.has_background
 
     # ------------------------------------------------------- tray / empty tray
     def calibrate_tray(self):
@@ -2018,14 +2397,17 @@ class MainWindow(QMainWindow):
             self.video.tray = self.tray
             if self.engine:
                 self.engine.set_tray(self.tray)
-            self.db.clear_background()          # the reference no longer matches the new crop
+            self.db.clear_background()          # neither reference matches the new crop
             self.db.save()
+            if self.engine:
+                self.engine.reload_segmenter()
+                self.video.hint = tr("capture_empty_first")
             self._refresh_items_ui()
             msg_info(self, tr("tray_saved"))
         dlg.deleteLater()
 
     def capture_empty_tray(self):
-        if not self._require_engine() or self._bg_wanted:
+        if not self._require_engine() or self._bg_wanted or self._bg_frames:
             return
         if self.current_weight is not None and self.scale is not None and not self.scale.is_simulated \
                 and self.current_weight.weight_kg >= float(self.settings.get("scale.min_weight_kg", 0.005)):
@@ -2033,36 +2415,61 @@ class MainWindow(QMainWindow):
             return
         if not ask(self, tr("empty_tray_confirm")):
             return
-        self._bg_pending = []
-        self._bg_wanted = 5
-        self._bg_thumb = None
-        self._capture_bg_frame(0)
+        self._bg_frames = []
+        self._grab_bg_frame(0)
 
-    def _capture_bg_frame(self, i: int):
-        crop_box = self.engine.current_crop() if self.engine else None
-        if crop_box is None:
-            self._bg_wanted = 0
+    def _grab_bg_frame(self, attempt: int):
+        _, frame = self._camera_frame()
+        if frame is not None:
+            self._bg_frames.append(frame.copy())
+        if len(self._bg_frames) < BUILD_FRAMES and attempt < 40:
+            QTimer.singleShot(200, lambda: self._grab_bg_frame(attempt + 1))
+        else:
+            self._finish_empty_tray()
+
+    def _finish_empty_tray(self):
+        frames, self._bg_frames = self._bg_frames, []
+        if len(frames) < 3:
             msg_error(self, tr("no_frame"))
             return
-        crop, _ = crop_box
-        if self._bg_thumb is None:
-            self._bg_thumb = make_thumbnail(crop, 96)
-        self.engine.request_embedding(crop, lambda emb: self.bus.embedding_ready.emit("bg", emb), augment=True)
-        if i + 1 < self._bg_wanted:
-            QTimer.singleShot(250, lambda: self._capture_bg_frame(i + 1))
+        h, w = frames[0].shape[:2]
+        try:
+            model = EmptyTrayModel.build(frames, self.tray.bbox(w, h), self.tray.pixel_points(w, h).tolist(),
+                                         work=int(self.settings.get("ai.segment_work", 192)))
+            self._bg_payload = model.to_payload()
+        except Exception as exc:
+            log.exception("empty-tray model failed")
+            msg_error(self, str(exc))
+            return
+        crop, _ = self.tray.crop(frames[-1])
+        self._bg_thumb = make_thumbnail(crop, 96)
+        self._bg_pending = []
+        self._bg_wanted = 3
+        for f in (frames[0], frames[len(frames) // 2], frames[-1]):
+            c, _ = self.tray.crop(f)
+            self.engine.request_embedding(c, lambda e: self.bus.embedding_ready.emit("bg", e), True)
 
     def on_embedding(self, token: str, embeddings: np.ndarray):
+        if token.startswith("reinforce:"):
+            item_id = token.split(":", 1)[1]
+            item = self.db.reinforce(item_id, embeddings[0], int(self.settings.get("ai.drift_cap", 5)))
+            if item is not None:
+                self.db.save()
+                self.status.showMessage(tr("reinforced", name=item.name), 4000)
+            return
         if token != "bg" or not self._bg_wanted:
             return
         self._bg_pending.append(embeddings)
         if len(self._bg_pending) >= self._bg_wanted:
             emb = np.vstack(self._bg_pending)
-            self.db.set_background(emb, self._bg_thumb)
+            self.db.set_background(emb, self._bg_thumb, self._bg_payload)
             self.db.save()
             self._bg_wanted = 0
             self._bg_pending = []
             if self.engine:
+                self.engine.reload_segmenter()
                 self.engine.reset_smoothing()
+                self.video.hint = "" if self.engine.has_segmenter else tr("capture_empty_first")
             self._refresh_items_ui()
             self.status.showMessage(tr("empty_tray_saved", count=len(emb)), 6000)
 
@@ -2072,6 +2479,11 @@ class MainWindow(QMainWindow):
         self.stop_scale()                     # free the COM port for the monitor / diagnosis
         dlg = SettingsDialog(self, self.settings, self._make_printer, self.bus)
         accepted = dlg.exec() == QDialog.DialogCode.Accepted
+        # a diagnosis worker may still own the port; wait for it before reopening
+        diag = getattr(dlg, "_diag_thread", None)
+        if diag is not None and diag.is_alive():
+            self.status.showMessage(tr("diag_running"), 3000)
+            diag.join(30.0)
         dlg.deleteLater()
         after = self.settings.as_dict()
         self.apply_settings(before, after, accepted)
@@ -2088,6 +2500,9 @@ class MainWindow(QMainWindow):
             self.engine.set_empty_threshold(float(after["ai"].get("empty_threshold", 0.88)))
             self.engine.set_smoothing(int(after["ai"]["smoothing_frames"]))
             self.engine.set_motion_gate(bool(after["ai"].get("motion_gate", True)), float(after["ai"].get("motion_threshold", 6.0)))
+            self.engine.set_per_object(bool(after["ai"].get("per_object_recognition", True)))
+            self.engine.max_objects = int(after["ai"].get("max_objects", 5))
+            self.engine.reload_segmenter()
         self.start_scale()                    # always: it was stopped for the dialog
         if accepted:
             self.printer = self._make_printer(after["printer"], after["general"])

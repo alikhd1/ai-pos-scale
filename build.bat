@@ -5,6 +5,7 @@ REM
 REM  Usage:   build.bat            -> dist\AIPosScale\AIPosScale.exe   (onedir, fast start-up)
 REM           build.bat /onefile   -> dist\AIPosScale.exe              (single file, slower start-up)
 REM           build.bat /skipdeps  -> do not reinstall requirements
+REM           build.bat /skiptests -> skip the regression suite
 REM
 REM  Requirements: 64-bit Python 3.10+ in PATH, internet for the first run
 REM  (pip packages + MobileNetV2 weights, ~14 MB). Everything is bundled, so
@@ -16,10 +17,12 @@ cd /d "%~dp0"
 set APP_NAME=AIPosScale
 set MODE=onedir
 set SKIPDEPS=0
+set SKIPTESTS=0
 for %%A in (%*) do (
     if /I "%%~A"=="/onefile"  set MODE=onefile
     if /I "%%~A"=="--onefile" set MODE=onefile
     if /I "%%~A"=="/skipdeps" set SKIPDEPS=1
+    if /I "%%~A"=="/skiptests" set SKIPTESTS=1
 )
 
 echo.
@@ -71,10 +74,17 @@ if exist RTKCamSDK.dll (
 )
 
 echo.
-echo ==== [5/6] Self-test of the source tree ===================================
+echo ==== [5/6] Self-test and regression suite =================================
 python app.py --selftest
 if errorlevel 1 (
     echo WARNING: self-test reported problems ^(see selftest_report.txt^). Continuing the build.
+)
+if /I not "%SKIPTESTS%"=="1" (
+    python tests\run_all.py
+    if errorlevel 1 (
+        echo ERROR: regression tests failed. Fix them or rebuild with /skiptests.
+        exit /b 1
+    )
 )
 
 echo.

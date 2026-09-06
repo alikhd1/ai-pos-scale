@@ -61,7 +61,16 @@ DEFAULTS: Dict[str, Dict[str, Any]] = {
         "motion_gate": True,              # skip the network while the tray image is static
         "motion_threshold": 6.0,          # mean grey-level change (0-255) that counts as motion
         "empty_threshold": 0.88,          # similarity to the empty-tray reference that means "tray empty"
-        "min_train_samples": 3,           # recommended minimum samples per item
+        "min_train_samples": 3,           # hard minimum samples per item
+        "good_train_samples": 6,          # captures beyond which accuracy stops climbing steeply
+        "per_object_recognition": True,   # recognise every detected object, not the whole tray
+        "max_objects": 5,                 # most objects reported in one frame
+        "min_area_frac": 0.008,           # smallest object, as a fraction of the tray area
+        "segment_work": 192,              # segmentation working resolution (long side)
+        "threshold_percentile": 99.0,     # per-item accept threshold from the impostor distribution
+        "whitened_ranking": True,         # rank with PCA-whitening, accept with the top-PC-removed score
+        "drift_cap": 5,                   # operator-corrected samples kept per item (0 disables)
+        "background_refresh": True,       # slowly blend the empty tray back in as the shop light drifts
         "auto_capture": False,            # training dialog: capture automatically instead of per button press
         "auto_capture_interval_ms": 700,
         "top_k": 3,                       # per item score = mean of top-k sample similarities
@@ -71,7 +80,7 @@ DEFAULTS: Dict[str, Dict[str, Any]] = {
     },
     "scale": {
         "enabled": True,
-        "simulate": True,                 # slider instead of hardware until a port is configured
+        "simulate": False,                # slider instead of hardware until a port is configured
         "port": "",
         "baudrate": 9600,
         "bytesize": 8,
@@ -90,6 +99,12 @@ DEFAULTS: Dict[str, Dict[str, Any]] = {
         "assert_dtr": True,
         "assert_rts": True,
         "reconnect_s": 3.0,
+    },
+    "pos": {
+        "multi_item_mode": "interlock",   # off | interlock (refuse to price a mixed tray) | quantity
+        "refuse_on_intrusion": True,      # a hand over the tray blocks Add
+        "refuse_on_unreliable": True,     # failed photometric alignment blocks Add
+        "reinforce_on_manual_pick": True, # a manual item pick teaches the model today's lighting
     },
     "printer": {
         "enabled": True,

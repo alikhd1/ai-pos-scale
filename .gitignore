@@ -19,3 +19,7 @@ receipt_preview.png
 
 # large downloaded weights (build.bat re-downloads them)
 models/*.pth
+
+# empty-tray reference images and scratch data
+*.corrupt
+tests/__pycache__/
