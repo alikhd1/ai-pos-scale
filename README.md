@@ -24,6 +24,8 @@ till in a few seconds; no data-science workflow, no labelled dataset, no interne
 | `tray_segment.py` | finds up to 5 objects on the tray against the stored empty-tray image |
 | `ai_engine.py` | MobileNetV2 embeddings, two-headed matcher, `items_db.pkl`, recognition thread |
 | `rtk_camera.py` | ctypes binding of `RTKCamSDK.dll` (+ OpenCV fallback, camera thread) |
+| `hid_scale.py` | USB HID scales (the kind that is not a COM port at all) |
+| `diagnostics.py` | one-click zip with the frame, masks, crops and scores, for support |
 | `scale_driver.py` | serial scale reader/parser, simulator, live monitor, auto-detect diagnosis |
 | `printer_driver.py` | ESC/POS builder, Windows-spooler / COM transports, Persian bitmap receipts |
 | `settings_manager.py` | `config.json` load/save with defaults |
@@ -62,11 +64,15 @@ Do these three steps in order. Skipping step 2 leaves multi-object detection swi
    frames as a background model (about 60 KB) plus a per-pixel noise map. This is what
    makes object detection possible, and it is also how the app knows the tray is empty.
    Repeat it after the lighting, the tray or the camera position changes.
-3. **Scale** (Settings, F10). Pick the COM port and press *Diagnose (auto-detect)*: it
-   listens with the current settings, then tries the other baud rates, parities and the
-   common request commands, and proposes working settings. A successful diagnosis also
-   switches simulation off for you. *Start monitor* shows every frame the scale sends,
-   as text and hex, with the parsed weight beside it.
+3. **Scale** (Settings, F10). Press **Find my scale**. It searches USB HID scales *and*
+   every COM port at every common baud rate, parity and request command, then applies
+   whatever answered. Use it first; the other buttons are for when it finds nothing.
+   *Start monitor* shows every frame the scale sends, as text and hex, with the parsed
+   weight beside it, and *Copy report* puts the whole log on the clipboard to send on.
+
+   Not every scale is a serial port. Many integrated POS scales are **USB HID** devices,
+   which a serial-only driver cannot see at any baud rate. Those are now supported and
+   are what *Automatic* tries first.
 4. **Printer** (Settings). Windows printer or COM port, paper width, header/footer,
    *Print Test Receipt*.
 
@@ -81,6 +87,27 @@ Do these three steps in order. Skipping step 2 leaves multi-object detection swi
 2. **Sell**. Place the products. Each detected object gets its own box and label. Press
    *Add to Invoice* (Enter / Space). Tap an object in the image first to pick which one.
 3. **Checkout & Print** (F5). Saves `invoices\YYYY-MM\invoice_000123.json` and prints.
+
+### Weighing, and catching a tray that does not match the invoice
+
+By default the products **stay on the tray** and each new line is the difference:
+
+| step | tray reads | invoice holds | new line |
+|---|---|---|---|
+| put product A on | 0.100 | 0.000 | 0.100 |
+| add A to the invoice | 0.100 | 0.100 | - |
+| put product B on as well | 0.300 | 0.100 | 0.200 |
+| add B to the invoice | 0.300 | 0.300 | - |
+
+The line under the weight always shows *on the tray* against *on the invoice*. Because
+everything billed should still be on the pan and nothing else should be, any disagreement
+is visible immediately and is checked again at checkout: an unbilled item slipped on, or
+one swapped for a heavier one after being scanned, shows up as a weight that does not add
+up, and finishing asks for confirmation. Settings > General sets the allowed difference
+(20 g by default) and whether a mismatch blocks checkout.
+
+Switch to *Tray is emptied between items* if your staff prefer to weigh one product at a
+time; then each line is simply the whole tray and no reconciliation is done.
 
 ### What happens with several products on the tray
 
@@ -129,7 +156,14 @@ Latin receipts. Transports: any Windows printer (RAW spool) or a serial COM prin
 * **No boxes around the objects.** The empty-tray reference is missing (the camera view says
   so). Capture it with F6. It is also cleared automatically whenever the tray area changes.
 * **A product is recognised as another one.** Manage Items warns which pairs look alike to
-  the camera. Add more views (F3) of both, from the angles that get confused.
+  the camera. Add more views (F3) of both, from the angles that get confused. When the app
+  is unsure it now lists the alternatives under the picture rather than guessing; tapping
+  the right one both bills it and teaches the model that view.
+* **It does not detect my goods properly.** Press **Save diagnostics**. It writes a zip
+  next to the program containing the camera frame, the tray outline, the exact crop each
+  object is recognised from, the masks, every candidate score, and the catalogue. Send
+  that file: segmentation and recognition faults depend entirely on what your camera sees
+  on your counter, and this is what makes them fixable.
 * **Everything reads as unknown after a lamp changed.** Re-capture the empty tray, and add a
   few views under the new light. Picking the item by hand also teaches it: each manual pick
   stores that view, capped at five per item, and Manage Items can forget them again.
@@ -161,6 +195,49 @@ verdict did not exist, because raw cosines between crops that share a tray all s
 0.76 and 0.94. Every one of those numbers is reproduced by `tests/test_matcher.py` on
 synthetic data, not quoted from a paper.
 
+**Two thresholds, not one.** A single cut-off has to choose between rejecting correct
+products and billing wrong ones, and either choice is bad at a till. So each item gets
+both an *accept* level and a lower *offer* level, each calibrated from that item's own
+data: how well a held-out view of it scores, and how well every other item scores against
+it.
+
+| score | what happens |
+|---|---|
+| above the accept level | billed straight away, no tap |
+| between the two | the item and its look-alikes are listed under the picture: "Is it X?" |
+| below the offer level | unknown item |
+
+On the test set that gives 83% of queries billed with no tap, the correct product offered
+first for 94%, and **nothing that was never enrolled is ever billed automatically**. When
+two of your products genuinely look alike to the camera, you get a choice instead of a
+silent guess, and the one you tap is also remembered as a new view of that product.
+
+## Speed
+
+The model is traced and optimized for the machine it runs on, which measured **about
+1.7x faster** per object in the shipped build - 40 ms down to 24 ms for a whole
+recognition, repeatable over three runs on a settled machine - with numerically
+identical output, so nothing about accuracy changes. Expect a lower figure from a
+single run taken right after a build, while the machine is still busy. It happens on a background thread, so the
+till works immediately and switches over when it is ready. Turn it off with
+`ai.fast_inference` if a machine ever misbehaves.
+
+Two things measured and *rejected*, so nobody repeats them: batching several crops into
+one forward pass is not faster on this CPU, and shrinking the network input below 224
+costs more accuracy than it buys speed. Preprocessing is only about 2 ms of a call, so
+there is nothing to win there either - the time is in the network.
+
+Beyond that, the network is simply not run when it does not need to be: not while the
+tray image is unchanged, not for an object whose box has not moved, and never more than
+three new objects in one frame. Segmentation itself costs about 20 ms.
+
+Check it on your own machine: `AIPosScale.exe --selftest` prints a line like
+`speed per object: 38 ms -> 25 ms after optimizing for this CPU (1.5x, built in 3s)`.
+If it says the model could *not* be optimized, recognition is running slower than it
+should and `aipos.log` says why. The optimizer needs `sympy`, which must be in the build
+(`torch.jit.trace` imports it) - excluding it disables the speed-up silently, because the
+app correctly falls back to the slower path instead of failing.
+
 ## Notes on PyTorch packaging
 
 PyInstaller does not bundle torchvision's C++ extension (`torchvision._C`) reliably, so
@@ -191,3 +268,5 @@ every item, and the matcher changes above buy far more accuracy for no migration
   A version 2 file loads unchanged; its items keep working in whole-tray mode.
 * `invoices/` - one JSON per invoice + `counter.json`.
 * `aipos.log`, `crash_history.txt`, `selftest_report.txt` - diagnostics.
+* `aipos_diagnostics_*.zip` - written by *Save diagnostics*; safe to delete, and safe
+  to send on (images of the tray and the settings, no personal or payment data).

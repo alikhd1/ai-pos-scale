@@ -63,32 +63,43 @@ def build_world(fx):
 
 
 def test_accuracy_and_rejection(fx):
-    print("\n[1] top-1 accuracy and unknown rejection")
+    print("\n[1] accuracy, and what happens when the model is not sure")
     db, seg = build_world(fx)
     rec = Recognizer(db, 0.65)
-    thresholds = {i.name: round(i.threshold, 3) for i in db.all_items()}
-    print(f"    calibrated thresholds: {thresholds}")
-    check("every item got a positive calibrated threshold", all(v > 0 for v in thresholds.values()), str(thresholds))
+    thresholds = {i.name: (round(i.suggest_threshold, 3), round(i.threshold, 3)) for i in db.all_items()}
+    print(f"    thresholds (suggest, accept): {thresholds}")
+    check("every item has a usable accept threshold", all(v[1] > 0 for v in thresholds.values()), str(thresholds))
+    check("the suggest threshold never exceeds the accept one",
+          all(v[0] <= v[1] for v in thresholds.values()), str(thresholds))
 
-    correct = total = 0
+    auto = offered = total = 0
     for spec in S.CLASSES:
         for angle, centre, gain in ((20, (280, 220), 1.0), (95, (380, 300), 0.85), (150, (240, 300), 1.15)):
             crop = crop_for(fx, seg, spec, centre, angle, 1.05, seed=50, gain=gain)
             m = rec.match(fx.embed(crop), MODE_OBJECT)
             total += 1
+            top = m.ranking[0][1] if m.ranking else ""
             if m.accepted and m.name == spec[0]:
-                correct += 1
-    acc = correct / total
-    check("top-1 accuracy on enrolled produce", acc >= 0.80, f"{acc:.0%} ({correct}/{total})")
+                auto += 1
+                offered += 1
+            elif m.suggested and top == spec[0]:
+                offered += 1          # shown to the operator as the first choice
+    print(f"    billed automatically {auto}/{total}, correct item offered first {offered}/{total}")
+    check("the right item is offered for nearly every query", offered / total >= 0.85,
+          f"{offered}/{total}")
+    check("most queries need no tap at all", auto / total >= 0.55, f"{auto}/{total}")
 
-    false_accepts = 0
-    trials = 6
-    for i in range(trials):
+    # produce that was never enrolled must never be billed on its own
+    auto_far = suggested_far = trials = 0
+    for i in range(6):
         crop = crop_for(fx, seg, S.UNKNOWN, (300, 240), i * 30, 1.0, seed=60 + i)
-        if rec.match(fx.embed(crop), MODE_OBJECT).accepted:
-            false_accepts += 1
-    far = false_accepts / trials
-    check("never-enrolled produce is rejected", far <= 0.35, f"false-accept rate {far:.0%} ({false_accepts}/{trials})")
+        m = rec.match(fx.embed(crop), MODE_OBJECT)
+        trials += 1
+        auto_far += int(m.accepted)
+        suggested_far += int(m.suggested)
+    print(f"    never-enrolled produce: auto-billed {auto_far}/{trials}, merely suggested {suggested_far}/{trials}")
+    check("never-enrolled produce is never billed automatically", auto_far == 0,
+          f"{auto_far}/{trials} auto-accepted")
     return db
 
 

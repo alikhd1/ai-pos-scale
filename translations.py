@@ -260,6 +260,57 @@ STRINGS = {
     "reinforced": ("Learned this view of {name}", "این نمای {name} آموخته شد"),
     "learn_manual": ("Learn from manual item picks", "یادگیری از انتخاب دستی کالا"),
 
+    # ---- scale source ----
+    "scale_source": ("Scale connection", "نوع اتصال ترازو"),
+    "source_auto": ("Automatic (USB scale, then COM port)", "خودکار (ترازوی USB، سپس پورت COM)"),
+    "source_hid": ("USB scale (HID)", "ترازوی USB (HID)"),
+    "source_serial": ("Serial COM port", "پورت سریال COM"),
+    "source_simulate": ("Simulation (no hardware)", "شبیه\u200cسازی (بدون سخت\u200cافزار)"),
+    "hid_device": ("USB scale device", "دستگاه ترازوی USB"),
+    "hid_none": ("no USB scale found", "ترازوی USB پیدا نشد"),
+    "find_scale": ("Find my scale", "پیدا کردن ترازو"),
+    "find_scale_running": ("Searching every port and USB device, please wait...",
+                           "در حال جستجوی همه پورت\u200cها و دستگاه\u200cهای USB، لطفاً صبر کنید..."),
+    "find_scale_found": ("Found: {label}", "پیدا شد: {label}"),
+    "find_scale_none": ("No scale answered. Check power, cable and that no other program uses the port.",
+                        "هیچ ترازویی پاسخ نداد. برق، کابل و اینکه برنامه دیگری پورت را اشغال نکرده باشد را بررسی کنید."),
+    "apply_found": ("Use this scale", "استفاده از این ترازو"),
+    "scale_via": ("via {source}", "از طریق {source}"),
+
+    # ---- weight and the invoice ----
+    "tray_weight": ("On the tray", "روی سینی"),
+    "invoiced_weight": ("On the invoice", "در فاکتور"),
+    "new_weight": ("New item", "کالای جدید"),
+    "weighing_mode": ("Weighing", "روش توزین"),
+    "mode_cumulative": ("Items stay on the tray (weigh the difference)", "کالاها روی سینی می\u200cمانند (اختلاف وزن)"),
+    "mode_replace": ("Tray is emptied between items", "سینی بین کالاها خالی می\u200cشود"),
+    "weight_mismatch": ("The tray holds {diff} more than the invoice", "سینی {diff} بیشتر از فاکتور است"),
+    "weight_missing": ("The tray holds {diff} less than the invoice", "سینی {diff} کمتر از فاکتور است"),
+    "weight_matches": ("Tray matches the invoice", "وزن سینی با فاکتور مطابقت دارد"),
+    "checkout_mismatch": ("The tray does not match the invoice ({diff}). Check the items before finishing.",
+                          "وزن سینی با فاکتور مطابقت ندارد ({diff}). قبل از پایان، کالاها را بررسی کنید."),
+    "checkout_anyway": ("Finish anyway", "به هر حال پایان بده"),
+    "nothing_new": ("Nothing new on the tray", "کالای جدیدی روی سینی نیست"),
+    "weight_tolerance": ("Allowed difference (kg)", "اختلاف مجاز (کیلوگرم)"),
+    "block_mismatch": ("Block checkout when the tray does not match", "جلوگیری از تسویه وقتی وزن مطابقت ندارد"),
+
+    # ---- similar items ----
+    "did_you_mean": ("Or is it:", "یا شاید:"),
+    "ambiguous": ("Two items look alike here. Please choose.", "دو کالا اینجا شبیه هم هستند. لطفاً انتخاب کنید."),
+    "chosen": ("Chosen: {name}", "انتخاب\u200cشده: {name}"),
+    "candidates_label": ("Alternatives", "گزینه\u200cهای دیگر"),
+    "is_it": ("Is it {name}? Tap to confirm.", "آیا {name} است؟ برای تأیید بزنید."),
+    "confirm_needed": ("Not sure - choose the item below", "مطمئن نیستم - کالا را از پایین انتخاب کنید"),
+
+    # ---- performance ----
+    "fast_inference": ("Optimize the model for this CPU (recommended)", "بهینه\u200cسازی مدل برای این پردازنده (توصیه می\u200cشود)"),
+    "optimizing_model": ("Optimizing the model for this CPU...", "در حال بهینه\u200cسازی مدل برای این پردازنده..."),
+    "optimized_ready": ("Model optimized: recognition is now about three times faster",
+                        "مدل بهینه شد: تشخیص حدود سه برابر سریع\u200cتر شد"),
+
+    "save_diagnostics": ("Save diagnostics", "ذخیره اطلاعات عیب‌یابی"),
+    "diagnostics_saved": ("Diagnostic file saved: {path}", "فایل عیب‌یابی ذخیره شد: {path}"),
+
     # ---- camera backend ----
     "rtk_note": ("RTKCamSDK.dll is 32-bit and cannot be loaded inside this 64-bit application; the same camera is used through OpenCV.",
                  "فایل RTKCamSDK.dll سی‌ودو بیتی است و در این برنامه‌ی ۶۴ بیتی بارگذاری نمی‌شود؛ همان دوربین از طریق OpenCV استفاده می‌شود."),

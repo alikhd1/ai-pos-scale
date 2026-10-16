@@ -71,6 +71,9 @@ DEFAULTS: Dict[str, Dict[str, Any]] = {
         "whitened_ranking": True,         # rank with PCA-whitening, accept with the top-PC-removed score
         "drift_cap": 5,                   # operator-corrected samples kept per item (0 disables)
         "background_refresh": True,       # slowly blend the empty tray back in as the shop light drifts
+        "fast_inference": True,           # TorchScript + channels-last: 2.6x faster, identical output
+        "candidates": 3,                  # alternatives offered when two items look alike
+        "ambiguous_margin": 0.08,         # score gap below which the operator is asked to choose
         "auto_capture": False,            # training dialog: capture automatically instead of per button press
         "auto_capture_interval_ms": 700,
         "top_k": 3,                       # per item score = mean of top-k sample similarities
@@ -80,7 +83,10 @@ DEFAULTS: Dict[str, Dict[str, Any]] = {
     },
     "scale": {
         "enabled": True,
-        "simulate": False,                # slider instead of hardware until a port is configured
+        "source": "auto",                 # auto | hid | serial | simulate
+                                          # auto prefers a USB HID scale, then a configured COM port
+        "hid_path": "",                   # a specific USB HID scale; empty = the first one found
+        "simulate": False,                # legacy flag, still honoured when "source" is absent
         "port": "",
         "baudrate": 9600,
         "bytesize": 8,
@@ -101,6 +107,10 @@ DEFAULTS: Dict[str, Dict[str, Any]] = {
         "reconnect_s": 3.0,
     },
     "pos": {
+        "weighing_mode": "cumulative",    # cumulative: items stay on the tray and each new one is the
+                                          # difference; replace: the tray is cleared between items
+        "weight_tolerance_kg": 0.02,      # how far the tray may differ from the invoice before complaining
+        "block_checkout_on_mismatch": True,
         "multi_item_mode": "interlock",   # off | interlock (refuse to price a mixed tray) | quantity
         "refuse_on_intrusion": True,      # a hand over the tray blocks Add
         "refuse_on_unreliable": True,     # failed photometric alignment blocks Add

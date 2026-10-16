@@ -31,6 +31,11 @@ import numpy as np
 
 from settings_manager import SettingsManager, app_dir, data_path, resource_path, is_frozen
 from translations import tr, set_language, is_rtl
+from scale_driver import (ScaleReader, list_serial_ports, diagnose_scale, find_scale, make_scale,
+                          resolve_source, BAUDRATES, WeightReading, printable, hexdump,
+                          SOURCE_AUTO, SOURCE_HID, SOURCE_SERIAL, SOURCE_SIMULATE)
+from hid_scale import list_hid_scales
+import diagnostics
 
 log = logging.getLogger("app")
 
@@ -148,6 +153,9 @@ def receipt_labels() -> dict:
             "price": tr("col_price"), "total": tr("col_total"), "grand_total": tr("grand_total"), "items": tr("items")}
 
 
+SOURCE_CLASS = {SOURCE_HID: "HidScaleReader", SOURCE_SERIAL: "ScaleReader", SOURCE_SIMULATE: "SimulatedScale"}
+
+
 def scale_mode_reason(settings: SettingsManager) -> str:
     """Single source of truth for which scale object exists and why.
 
@@ -155,20 +163,12 @@ def scale_mode_reason(settings: SettingsManager) -> str:
     wiring test, so "what the settings dialog tested" and "what the main window
     actually built" can never drift apart again without a test failing.
     """
-    sc = settings.section("scale")
-    port = (sc.get("port") or "").strip()
-    if not sc.get("enabled", True):
-        return "SimulatedScale: scale.enabled = false"
-    if sc.get("simulate"):
-        return f"SimulatedScale: scale.simulate = true (port {port or '-'} ignored)"
-    if not port:
-        return "SimulatedScale: no COM port configured"
-    return f"ScaleReader: {port} @ {sc.get('baudrate')} {sc.get('bytesize')}{sc.get('parity')}{sc.get('stopbits')}"
+    source, reason = resolve_source(settings.section("scale"))
+    return f"{SOURCE_CLASS.get(source, source)}: {reason}"
 
 
 def scale_is_simulated(settings: SettingsManager) -> bool:
-    sc = settings.section("scale")
-    return bool(sc.get("simulate") or not (sc.get("port") or "").strip() or not sc.get("enabled", True))
+    return resolve_source(settings.section("scale"))[0] == SOURCE_SIMULATE
 
 
 # --------------------------------------------------------------------------- #
@@ -223,13 +223,35 @@ def run_selftest(settings: SettingsManager, video_file: str = "") -> int:
     section("ai")
     try:
         t0 = time.time()
-        fx = FeatureExtractor(model_file_path(settings), int(settings.get("ai.num_threads", 1)))
+        # built without the fast path so the two speeds below are measured on an
+        # idle CPU; measuring while the optimizer thread runs flatters the result
+        fx = FeatureExtractor(model_file_path(settings), int(settings.get("ai.num_threads", 1)), fast=False)
         lines.append(f"MobileNetV2 loaded in {time.time() - t0:.1f}s from {fx.weights_path}")
         test_img = frame if frame is not None else np.full((480, 640, 3), 90, np.uint8)
         crop, box = tray.crop(test_img)
-        t0 = time.time()
+        def median_ms(n: int = 7) -> float:
+            samples = []
+            for _ in range(n):
+                t = time.perf_counter()
+                fx.embed(crop)
+                samples.append((time.perf_counter() - t) * 1000)
+            return float(np.median(samples))
+
         emb = fx.embed(crop)
-        lines.append(f"embedding dim={emb.shape[0]} norm={np.linalg.norm(emb):.3f} time={1000 * (time.time() - t0):.0f} ms bbox={box}")
+        eager_ms = median_ms()
+        lines.append(f"embedding dim={emb.shape[0]} norm={np.linalg.norm(emb):.3f} bbox={box}")
+        if settings.get("ai.fast_inference", True):
+            t1 = time.time()
+            fx._build_fast_path()
+            if fx.optimized:
+                fast_ms = median_ms()
+                lines.append(f"speed per object: {eager_ms:.0f} ms -> {fast_ms:.0f} ms after optimizing for this "
+                             f"CPU ({eager_ms / max(fast_ms, 0.01):.1f}x, built in {time.time() - t1:.0f}s)")
+            else:
+                lines.append(f"speed per object: {eager_ms:.0f} ms. The model could NOT be optimized for this "
+                             f"CPU, so recognition is slower than it should be (see aipos.log for the reason).")
+        else:
+            lines.append(f"speed per object: {eager_ms:.0f} ms (optimization is switched off in the settings)")
         db = ItemDatabase(settings.resolve("ai.db_file"))
         if db.backbone_mismatch:
             ok = False
@@ -267,11 +289,24 @@ def run_selftest(settings: SettingsManager, video_file: str = "") -> int:
     sample = parse_weight(b"ST,GS,+  1.234kg\r\n")
     lines.append(f"parser: {'OK' if sample and abs(sample.weight_kg - 1.234) < 1e-6 else 'FAILED'}")
     lines.append(f"mode: {scale_mode_reason(settings)}")
-    if scale_is_simulated(settings):
-        if (sc.get("port") or "").strip() and sc.get("simulate"):
+    try:
+        hid_scales = list_hid_scales()
+        lines.append(f"USB HID scales: {len(hid_scales)}" + "".join(f"\n  {d}" for d in hid_scales))
+    except Exception as exc:
+        lines.append(f"USB HID enumeration failed: {exc}")
+    source, _reason = resolve_source(sc)
+    if source == SOURCE_SIMULATE:
+        if (sc.get("port") or "").strip() and str(sc.get("source") or "") in ("", "simulate") and sc.get("simulate"):
             ok = False
             lines.append("  PROBLEM: a COM port is configured but simulation is ON, so the app shows a "
                          "simulated weight while the settings dialog tests the real port.")
+    elif source == SOURCE_HID:
+        from hid_scale import test_hid_scale
+        rep = test_hid_scale(sc.get("hid_path", ""), 3.0)
+        lines.append(f"USB HID scale: {'OK ' if rep['ok'] else 'PROBLEM '}{rep['message']}")
+        lines += [f"  {r}" for r in rep.get("raw", [])[:4]]
+        if not rep["ok"]:
+            ok = False
     else:
         rep = diagnose_scale(sc, quick=True)
         lines.append(f"hardware scale on {sc['port']}: {'OK ' if rep['ok'] else 'PROBLEM '}{rep['summary']}")
@@ -320,8 +355,6 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QLabel, QPushBu
                              QRadioButton, QButtonGroup)
 
 from rtk_camera import open_camera, CameraThread
-from scale_driver import (ScaleReader, SimulatedScale, list_serial_ports, diagnose_scale, BAUDRATES, WeightReading,
-                          printable, hexdump)
 from printer_driver import (ReceiptPrinter, Invoice, InvoiceLine, list_windows_printers, default_windows_printer,
                             fmt_money, fmt_weight)
 from ai_engine import (FeatureExtractor, ItemDatabase, RecognitionEngine, Recognition, Detection, Item, TrayRegion,
@@ -436,6 +469,7 @@ class VideoWidget(QWidget):
         self.has_items = False
         self.active_track = -1
         self.training: Optional[Tuple[int, int]] = None      # (captured, wanted)
+        self.show_masks = True
         self.caption = ""
         self.banner = ""
         self.hint = ""
@@ -543,6 +577,8 @@ class VideoWidget(QWidget):
             colour = QColor(COL_PENDING)
         elif d.accepted:
             colour = QColor(COL_OK)
+        elif d.suggested:
+            colour = QColor(COL_PENDING)
         else:
             colour = QColor(COL_UNKNOWN)
         active = d.track_id == self.active_track
@@ -550,7 +586,14 @@ class VideoWidget(QWidget):
         p.setBrush(Qt.BrushStyle.NoBrush)
         p.setPen(QPen(colour, 4 if active else 2, style))
         p.drawRoundedRect(r, 6, 6)
-        label = f"{d.name}  {d.score * 100:.0f}%" if d.accepted else tr("unknown_item")
+        if self.show_masks:
+            self._paint_outline(p, d, ox, oy, scale, colour)
+        if d.accepted:
+            label = f"{d.name}  {d.score * 100:.0f}%"
+        elif d.suggested:
+            label = f"{d.suggested_name}?  {d.result.score * 100:.0f}%"
+        else:
+            label = tr("unknown_item")
         p.setFont(QFont("Segoe UI", 11, QFont.Weight.Bold))
         fm = p.fontMetrics()
         label = fm.elidedText(label, Qt.TextElideMode.ElideRight, int(max(48, r.width() + 60)))
@@ -563,6 +606,26 @@ class VideoWidget(QWidget):
         p.drawRoundedRect(QRectF(r.left(), ty, tw, th), 5, 5)
         p.setPen(QColor("#0b0d11") if d.accepted else QColor("white"))
         p.drawText(QRectF(r.left(), ty, tw, th), Qt.AlignmentFlag.AlignCenter, label)
+
+    def _paint_outline(self, p, d: Detection, ox, oy, scale, colour):
+        """Trace the segmented silhouette, so the operator can see whether the
+        app has really found the whole item or only part of it."""
+        region = d.region
+        if region is None or region.mask is None or not region.mask.size:
+            return
+        try:
+            contours, _ = cv2.findContours(region.mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        except Exception:
+            return
+        x, y, _w, _h = d.box
+        pen = QPen(colour, 2, Qt.PenStyle.DotLine)
+        p.setPen(pen)
+        for contour in contours:
+            if len(contour) < 3:
+                continue
+            poly = QPolygonF([QPointF(ox + (x + int(pt[0][0])) * scale, oy + (y + int(pt[0][1])) * scale)
+                              for pt in contour[::2]])
+            p.drawPolygon(poly)
 
     def _paint_badge(self, p, rec, ox, oy, dw, dh, alert):
         if self.training:
@@ -591,7 +654,12 @@ class VideoWidget(QWidget):
                 d = acc[0]
                 text, colour = f"{d.name}   {d.score * 100:.0f}%", QColor(31, 157, 85, 230)
             else:
-                text, colour = tr("unknown_item"), QColor(120, 52, 60, 220)
+                guess = next((d for d in rec.confirmed if d.suggested), None)
+                if guess is not None:
+                    text = tr("is_it", name=guess.suggested_name)
+                    colour = QColor(138, 109, 31, 235)
+                else:
+                    text, colour = tr("unknown_item"), QColor(120, 52, 60, 220)
         p.setFont(QFont("Segoe UI", 15, QFont.Weight.Bold))
         fm = p.fontMetrics()
         text = fm.elidedText(text, Qt.TextElideMode.ElideRight, int(max(60, dw - 40)))
@@ -1168,6 +1236,7 @@ class SettingsDialog(QDialog):
         self.resize(860, 720)
         self._monitor: Optional[ScaleReader] = None
         self._suggestion: Optional[dict] = None
+        self._found: Optional[dict] = None
         self._diag_running = False
         tabs = QTabWidget()
         tabs.addTab(self._general_tab(), tr("tab_general"))
@@ -1191,14 +1260,26 @@ class SettingsDialog(QDialog):
         elif kind == "scale_done":
             self._diag_running = False
             self.diag_btn.setEnabled(True)
+            self.find_btn.setEnabled(True)
             self.apply_btn.setEnabled(self._suggestion is not None)
             self._append_scale(("PROBLEM: " if is_error else "OK: ") + text)
             # The bug this fixes: a diagnosis that succeeds returns no "suggestion",
-            # so the only code that ever unticked simulation was unreachable exactly
+            # so the only code that ever left simulation on was unreachable exactly
             # when the hardware worked first time.
-            if not is_error and self.simulate.isChecked():
-                self.simulate.setChecked(False)
+            if not is_error and self.source.currentData() == SOURCE_SIMULATE:
+                self.source.setCurrentIndex([SOURCE_AUTO, SOURCE_HID, SOURCE_SERIAL,
+                                             SOURCE_SIMULATE].index(SOURCE_SERIAL))
                 self._append_scale("-> " + tr("sim_unticked"))
+        elif kind == "scale_found":
+            self._diag_running = False
+            self.find_btn.setEnabled(True)
+            self.diag_btn.setEnabled(True)
+            self._append_scale(("PROBLEM: " if is_error else "OK: ") + text)
+            if self._found:
+                self._apply_found()
+                msg_info(self, tr("find_scale_found", label=self._found["label"]))
+            else:
+                msg_error(self, tr("find_scale_none"))
         elif kind == "print":
             (msg_error if is_error else msg_info)(self, text)
 
@@ -1241,6 +1322,21 @@ class SettingsDialog(QDialog):
         f.addRow(tr("currency"), self.currency)
         f.addRow(tr("currency_decimals"), self.cur_dec)
         f.addRow("", self.auto_add)
+        self.weigh_mode = QComboBox()
+        for key in ("cumulative", "replace"):
+            self.weigh_mode.addItem(tr(f"mode_{key}"), key)
+        wm = pos.get("weighing_mode", "cumulative")
+        self.weigh_mode.setCurrentIndex(0 if wm == "cumulative" else 1)
+        self.tolerance = QDoubleSpinBox()
+        self.tolerance.setRange(0.001, 1.0)
+        self.tolerance.setDecimals(3)
+        self.tolerance.setSingleStep(0.005)
+        self.tolerance.setValue(float(pos.get("weight_tolerance_kg", 0.02)))
+        self.block_mismatch = QCheckBox(tr("block_mismatch"))
+        self.block_mismatch.setChecked(bool(pos.get("block_checkout_on_mismatch", True)))
+        f.addRow(tr("weighing_mode"), self.weigh_mode)
+        f.addRow(tr("weight_tolerance"), self.tolerance)
+        f.addRow("", self.block_mismatch)
         f.addRow(tr("multi_item_mode"), self.multi_mode)
         f.addRow("", self.refuse_hand)
         f.addRow("", self.reinforce)
@@ -1325,8 +1421,17 @@ class SettingsDialog(QDialog):
         outer = QVBoxLayout(w)
         f = QFormLayout()
         s = self.settings.section("scale")
-        self.simulate = QCheckBox(tr("simulate_scale"))
-        self.simulate.setChecked(bool(s["simulate"]))
+        self.source = QComboBox()
+        for key in (SOURCE_AUTO, SOURCE_HID, SOURCE_SERIAL, SOURCE_SIMULATE):
+            self.source.addItem(tr(f"source_{key}"), key)
+        current = str(s.get("source") or (SOURCE_SIMULATE if s.get("simulate") else SOURCE_AUTO))
+        keys = [SOURCE_AUTO, SOURCE_HID, SOURCE_SERIAL, SOURCE_SIMULATE]
+        self.source.setCurrentIndex(keys.index(current) if current in keys else 0)
+        self.hid = QComboBox()
+        self._scan_hid()
+        hid_rescan = QPushButton(tr("scan_ports"))
+        hid_rescan.clicked.connect(self._scan_hid)
+        hrow = QHBoxLayout(); hrow.addWidget(self.hid); hrow.addWidget(hid_rescan)
         self.port = QComboBox()
         self.port.setEditable(True)
         scan = QPushButton(tr("scan_ports"))
@@ -1365,7 +1470,8 @@ class SettingsDialog(QDialog):
         self.hold.setValue(float(s.get("hold_last_s", 5.0)))
         self.stable_only = QCheckBox(tr("stable_only"))
         self.stable_only.setChecked(bool(s.get("stable_only", False)))
-        f.addRow("", self.simulate)
+        f.addRow(tr("scale_source"), self.source)
+        f.addRow(tr("hid_device"), hrow)
         f.addRow(tr("com_port"), prow)
         f.addRow(tr("baudrate"), self.baud)
         f.addRow(tr("data_bits"), self.bits)
@@ -1378,6 +1484,9 @@ class SettingsDialog(QDialog):
         f.addRow("", self.stable_only)
         outer.addLayout(f)
         brow = QHBoxLayout()
+        self.find_btn = QPushButton(tr("find_scale"))
+        self.find_btn.setObjectName("primary")
+        self.find_btn.clicked.connect(self._find_scale)
         self.monitor_btn = QPushButton(tr("start_monitor"))
         self.monitor_btn.clicked.connect(self._toggle_monitor)
         self.diag_btn = QPushButton(tr("diagnose_scale"))
@@ -1387,7 +1496,7 @@ class SettingsDialog(QDialog):
         self.apply_btn.clicked.connect(self._apply_suggestion)
         copy_btn = QPushButton(tr("copy_report"))
         copy_btn.clicked.connect(self._copy_report)
-        for b in (self.monitor_btn, self.diag_btn, self.apply_btn, copy_btn):
+        for b in (self.find_btn, self.monitor_btn, self.diag_btn, self.apply_btn, copy_btn):
             brow.addWidget(b)
         outer.addLayout(brow)
         outer.addWidget(QLabel(tr("serial_monitor")))
@@ -1400,6 +1509,67 @@ class SettingsDialog(QDialog):
         outer.addWidget(self.scale_result, 1)
         return w
 
+    def _scan_hid(self):
+        cur = self.hid.currentData()
+        self.hid.clear()
+        try:
+            devices = list_hid_scales()
+        except Exception:
+            devices = []
+        if not devices:
+            self.hid.addItem(tr("hid_none"), "")
+        for d in devices:
+            self.hid.addItem(f"{d.product or 'scale'} [{d.vid:04X}:{d.pid:04X}]", d.path)
+        if cur:
+            i = self.hid.findData(cur)
+            if i >= 0:
+                self.hid.setCurrentIndex(i)
+
+    def _find_scale(self):
+        """Search USB HID devices and every COM port, then offer what answered."""
+        if self._diag_running:
+            return
+        self._stop_monitor()
+        self._found = None
+        self._diag_running = True
+        self.find_btn.setEnabled(False)
+        self.diag_btn.setEnabled(False)
+        self._append_scale("=== " + tr("find_scale_running") + " ===")
+
+        def work():
+            try:
+                res = find_scale(progress=lambda line: self.bus.dialog_result.emit("scale_line", line, False))
+                self._found = res.get("best") if res.get("found") else None
+                message = (tr("find_scale_found", label=res["best"]["label"]) if res.get("found")
+                           else tr("find_scale_none"))
+                self.bus.dialog_result.emit("scale_found", message, not res.get("found"))
+            except Exception as exc:
+                self.bus.dialog_result.emit("scale_found", str(exc), True)
+
+        self._diag_thread = threading.Thread(target=work, daemon=True)
+        self._diag_thread.start()
+
+    def _apply_found(self):
+        cfg = (self._found or {}).get("config") or {}
+        if not cfg:
+            return
+        source = cfg.get("source", SOURCE_SERIAL)
+        keys = [SOURCE_AUTO, SOURCE_HID, SOURCE_SERIAL, SOURCE_SIMULATE]
+        self.source.setCurrentIndex(keys.index(source) if source in keys else 0)
+        if cfg.get("hid_path"):
+            self._scan_hid()
+            i = self.hid.findData(cfg["hid_path"])
+            if i >= 0:
+                self.hid.setCurrentIndex(i)
+        if cfg.get("port"):
+            self.port.setCurrentText(cfg["port"])
+            self.baud.setCurrentText(str(cfg.get("baudrate", 9600)))
+            self.bits.setCurrentText(str(cfg.get("bytesize", 8)))
+            self.parity.setCurrentIndex("NEOMS".index(cfg.get("parity", "N")))
+            self.stop.setCurrentText(str(cfg.get("stopbits", 1)))
+            self.poll.setText(cfg.get("poll_command", ""))
+        self._append_scale("applied: " + json.dumps({k: v for k, v in cfg.items() if k != "hid_path"}))
+
     def _scan_ports(self):
         cur = self.port.currentText()
         self.port.clear()
@@ -1410,12 +1580,14 @@ class SettingsDialog(QDialog):
 
     def _scale_config(self) -> dict:
         cfg = self.settings.section("scale")
-        cfg.update({"port": self.port.currentText().strip(), "baudrate": int(self.baud.currentText()),
+        source = self.source.currentData()
+        cfg.update({"source": source, "hid_path": self.hid.currentData() or "",
+                    "port": self.port.currentText().strip(), "baudrate": int(self.baud.currentText()),
                     "bytesize": int(self.bits.currentText()), "parity": self.parity.currentData(),
                     "stopbits": float(self.stop.currentText()), "poll_command": self.poll.text(),
                     "unit": self.unit.currentText(), "implied_decimals": self.implied.value(),
                     "hold_last_s": float(self.hold.value()), "stable_only": self.stable_only.isChecked(),
-                    "simulate": self.simulate.isChecked(), "enabled": True})
+                    "simulate": source == SOURCE_SIMULATE, "enabled": True})
         return cfg
 
     def _append_scale(self, text: str):
@@ -1499,7 +1671,7 @@ class SettingsDialog(QDialog):
             self.stop.setCurrentText(str(sug["stopbits"]))
         if "poll_command" in sug:
             self.poll.setText(sug["poll_command"])
-        self.simulate.setChecked(False)
+        self.source.setCurrentIndex([SOURCE_AUTO, SOURCE_HID, SOURCE_SERIAL, SOURCE_SIMULATE].index(SOURCE_SERIAL))
         self._append_scale("applied: " + json.dumps(sug))
 
     def _copy_report(self):
@@ -1594,7 +1766,10 @@ class SettingsDialog(QDialog):
                                      "auto_add": self.auto_add.isChecked()})
         s.update_section("pos", {"multi_item_mode": self.multi_mode.currentData(),
                                  "refuse_on_intrusion": self.refuse_hand.isChecked(),
-                                 "reinforce_on_manual_pick": self.reinforce.isChecked()})
+                                 "reinforce_on_manual_pick": self.reinforce.isChecked(),
+                                 "weighing_mode": self.weigh_mode.currentData(),
+                                 "weight_tolerance_kg": float(self.tolerance.value()),
+                                 "block_checkout_on_mismatch": self.block_mismatch.isChecked()})
         try:
             w, h = [int(x) for x in self.resolution.currentText().lower().replace("×", "x").split("x")]
         except Exception:
@@ -1637,6 +1812,10 @@ class MainWindow(QMainWindow):
         self._auto_armed = True
         self._last_frame_id = -1
         self._scale_conflict = False
+        self.scale_source = SOURCE_SIMULATE
+        self._override_item_id: Optional[str] = None     # operator picked from the alternatives
+        self._override_track = -1
+        self._optimize_notified = False
         self._bg_frames: List[np.ndarray] = []
         self._bg_payload = None
         self._bg_thumb: Optional[bytes] = None
@@ -1693,6 +1872,24 @@ class MainWindow(QMainWindow):
         self.conf_bar.setFormat(tr("confidence") + " %p%")
         ll.addWidget(self.detected_lbl)
         ll.addWidget(self.conf_bar)
+        # when two enrolled items look alike the app offers the alternatives
+        # instead of silently picking one of them
+        self.cand_box = QWidget()
+        cl = QHBoxLayout(self.cand_box)
+        cl.setContentsMargins(0, 0, 0, 0)
+        self.cand_lbl = QLabel(tr("did_you_mean"))
+        self.cand_lbl.setStyleSheet("color:#9aa3b5")
+        cl.addWidget(self.cand_lbl)
+        self.cand_buttons = []
+        for _ in range(3):
+            b = QPushButton("")
+            b.setMinimumHeight(40)
+            b.setVisible(False)
+            b.clicked.connect(lambda _c=False, btn=b: self._choose_candidate(btn))
+            self.cand_buttons.append(b)
+            cl.addWidget(b, 1)
+        self.cand_box.setVisible(False)
+        ll.addWidget(self.cand_box)
         brow = QHBoxLayout()
         self.train_btn = QPushButton(tr("train_new_item"))
         self.angle_btn = QPushButton(tr("add_angle_sample"))
@@ -1705,7 +1902,8 @@ class MainWindow(QMainWindow):
         brow2 = QHBoxLayout()
         self.tray_btn = QPushButton(tr("tray_calibrate"))
         self.empty_btn = QPushButton(tr("capture_empty_tray"))
-        for b in (self.tray_btn, self.empty_btn):
+        self.diag_btn = QPushButton(tr("save_diagnostics"))
+        for b in (self.tray_btn, self.empty_btn, self.diag_btn):
             b.setMinimumHeight(44)
             b.setMinimumWidth(60)
             brow2.addWidget(b)
@@ -1762,6 +1960,11 @@ class MainWindow(QMainWindow):
         self.use_real_btn.clicked.connect(self._switch_to_real_scale)
         sl.addWidget(self.use_real_btn)
         wl.addWidget(self.sim_box, 2, 0, 1, 3)
+        # tray vs invoice: the line that makes a missed or extra item obvious
+        self.recon_lbl = QLabel("")
+        self.recon_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.recon_lbl.setStyleSheet("color:#9aa3b5;font-size:14px")
+        wl.addWidget(self.recon_lbl, 3, 0, 1, 3)
         rl.addWidget(wbox)
 
         self.banner_lbl = QLabel("")
@@ -1867,6 +2070,7 @@ class MainWindow(QMainWindow):
         self.manage_btn.clicked.connect(self.manage_items)
         self.tray_btn.clicked.connect(self.calibrate_tray)
         self.empty_btn.clicked.connect(self.capture_empty_tray)
+        self.diag_btn.clicked.connect(self.save_diagnostics)
         self.add_btn.clicked.connect(self.add_detected)
         self.manual_btn.clicked.connect(self.add_manual)
         self.del_btn.clicked.connect(self.delete_selected)
@@ -1930,7 +2134,8 @@ class MainWindow(QMainWindow):
 
     def _load_model(self):
         try:
-            fx = FeatureExtractor(model_file_path(self.settings), int(self.settings.get("ai.num_threads", 1)))
+            fx = FeatureExtractor(model_file_path(self.settings), int(self.settings.get("ai.num_threads", 1)),
+                                  fast=bool(self.settings.get("ai.fast_inference", True)))
             self.bus.model_ready.emit(fx, None)
         except Exception as exc:
             log.exception("model load failed")
@@ -1978,9 +2183,15 @@ class MainWindow(QMainWindow):
         self.stop_scale()
         sc = self.settings.section("scale")
         port = (sc.get("port") or "").strip()
-        self._scale_conflict = bool(port) and bool(sc.get("simulate")) and bool(sc.get("enabled", True))
-        if sc.get("simulate") or not port or not sc.get("enabled", True):
-            self.scale = SimulatedScale(self.sim_spin.value())
+        source, _reason = resolve_source(sc)
+        self.scale_source = source
+        # the one state that looks exactly like a dead scale: a port is set
+        # but simulation was left on, so Settings tests the port and the main
+        # screen shows a fake zero
+        self._scale_conflict = (source == SOURCE_SIMULATE and bool(port) and bool(sc.get("enabled", True))
+                                and str(sc.get("source") or "simulate") in ("simulate", ""))
+        self.scale = make_scale(sc)
+        if source == SOURCE_SIMULATE:
             self.sim_box.setVisible(True)
             self.use_real_btn.setVisible(self._scale_conflict)
             self.use_real_btn.setText(tr("use_real_scale", port=port))
@@ -1990,9 +2201,10 @@ class MainWindow(QMainWindow):
             if self.engine:
                 self.engine.set_weight_hint(None)
         else:
-            self.scale = ScaleReader(sc)
             self.sim_box.setVisible(False)
             self.use_real_btn.setVisible(False)
+            self.scale_pill.setText(f"{tr('scale_status')}: {tr('scale_connecting')} "
+                                    + tr("scale_via", source=tr(f"source_{source}")))
         self.scale_pill.setToolTip(scale_mode_reason(self.settings))
         self.scale.subscribe(lambda r: self.bus.weight.emit(r))
         self.scale.start()
@@ -2001,6 +2213,7 @@ class MainWindow(QMainWindow):
 
     def _switch_to_real_scale(self):
         self.settings.set("scale.simulate", False)
+        self.settings.set("scale.source", SOURCE_AUTO)
         self.settings.save()
         self.start_scale()
 
@@ -2024,6 +2237,11 @@ class MainWindow(QMainWindow):
             n = len(rec.confirmed) if rec else 0
             seg = f" | seg {self.engine.seg_ms:.0f} ms" if self.engine.has_segmenter else ""
             self.status_ai.setText(f"AI {self.engine.stats_ms:.0f} ms{seg} | {n} obj")
+            fx = self.extractor
+            if fx is not None and not self._optimize_notified and not getattr(fx, "optimizing", False):
+                self._optimize_notified = True
+                if getattr(fx, "optimized", False):
+                    self.status.showMessage(tr("optimized_ready"), 6000)
         if self.scale is not None and not self.scale.is_simulated:
             self._update_scale_status()
 
@@ -2060,6 +2278,7 @@ class MainWindow(QMainWindow):
 
     def on_weight(self, reading: WeightReading):
         self.current_weight = reading
+        self._update_reconciliation()
         self.weight_lbl.setText(fmt_weight(reading.weight_kg, int(self.settings.get("general.weight_decimals", 3))))
         self.weight_lbl.setStyleSheet(WEIGHT_FRESH if reading.stable else WEIGHT_UNSTABLE)
         min_w = float(self.settings.get("scale.min_weight_kg", 0.005))
@@ -2082,15 +2301,30 @@ class MainWindow(QMainWindow):
         if self.video.training is not None:
             return
         active = self._active_detection()
+        if active is None or active.track_id != self._override_track:
+            self._override_item_id = None        # a different object: the choice no longer applies
+        self._update_candidates(active)
+        if self._override_item_id:
+            item = self.db.get(self._override_item_id)
+            if item is not None:
+                self.detected_lbl.setText(item.name)
+                self.detected_lbl.setStyleSheet("color:#ffd166")
+                self._maybe_auto_add()
+                return
         if rec.empty:
             self.detected_lbl.setText(tr("tray_empty"))
             self.detected_lbl.setStyleSheet("color:#9aa3b5")
             self.conf_bar.setValue(0)
             self._auto_armed = True
+            self._override_item_id = None
         elif active is not None and active.accepted:
             self.detected_lbl.setText(active.name)
             self.detected_lbl.setStyleSheet("color:#7CFC9A")
             self.conf_bar.setValue(int(active.score * 100))
+        elif active is not None and active.suggested:
+            self.detected_lbl.setText(tr("is_it", name=active.suggested_name))
+            self.detected_lbl.setStyleSheet("color:#ffcc4d")
+            self.conf_bar.setValue(int(active.result.score * 100))
         else:
             self.detected_lbl.setText(tr("unknown_item") if len(self.db) else tr("no_items_trained"))
             self.detected_lbl.setStyleSheet("color:#ffb4b4" if len(self.db) else "color:#9aa3b5")
@@ -2109,6 +2343,50 @@ class MainWindow(QMainWindow):
             msg_error(self, text)
 
     # ------------------------------------------------------ POS decisions
+    def _choose_candidate(self, button):
+        """The operator picked one of the look-alike alternatives."""
+        item_id = button.property("item_id")
+        if not item_id:
+            return
+        active = self._active_detection()
+        self._override_item_id = item_id
+        self._override_track = active.track_id if active else -1
+        item = self.db.get(item_id)
+        if item is not None:
+            self.detected_lbl.setText(item.name)
+            self.detected_lbl.setStyleSheet("color:#ffd166")
+            self.status.showMessage(tr("chosen", name=item.name), 4000)
+        self._update_candidates(active)
+
+    def _update_candidates(self, det: Optional[Detection]):
+        """Offer the runners-up whenever the catalogue holds a look-alike."""
+        limit = int(self.settings.get("ai.candidates", 3))
+        margin = float(self.settings.get("ai.ambiguous_margin", 0.08))
+        ranking = []
+        if det is not None and det.confirmed:
+            ranking = [(iid, name, score) for iid, name, score in det.result.ranking
+                       if iid and not iid.startswith("__") and self.db.get(iid) is not None]
+        unsure = det is not None and det.confirmed and det.suggested
+        if not ranking or (len(ranking) < 2 and not unsure):
+            self.cand_box.setVisible(False)
+            return
+        ambiguous = unsure or (len(ranking) > 1 and (ranking[0][2] - ranking[1][2]) < margin)
+        for i, button in enumerate(self.cand_buttons):
+            if i < min(limit, len(ranking)):
+                iid, name, score = ranking[i]
+                button.setText(f"{name}  {score * 100:.0f}%")
+                button.setProperty("item_id", iid)
+                chosen = (self._override_item_id or (det.item_id if det else None)) == iid
+                button.setObjectName("primary" if chosen else "")
+                button.setStyleSheet("")          # re-apply the stylesheet for the new object name
+                button.setVisible(True)
+            else:
+                button.setVisible(False)
+        self.cand_lbl.setText((tr("confirm_needed") if unsure else tr("ambiguous")) if ambiguous
+                              else tr("did_you_mean"))
+        self.cand_lbl.setStyleSheet("color:#ffcc4d" if ambiguous else "color:#9aa3b5")
+        self.cand_box.setVisible(True)
+
     def _active_detection(self) -> Optional[Detection]:
         rec = self.current_rec
         if rec is None:
@@ -2149,16 +2427,69 @@ class MainWindow(QMainWindow):
         self.add_btn.setEnabled(reason is None)
         self.video.banner = reason if reason and reason == tr("multi_item_block") else ""
 
+    def invoiced_weight(self) -> float:
+        """Everything already on the invoice, which should also still be on the tray."""
+        return float(sum(l.weight_kg for l in self.lines))
+
+    def tray_weight(self) -> Optional[float]:
+        return self.current_weight.weight_kg if self.current_weight else None
+
+    def weight_difference(self) -> Optional[float]:
+        """Tray minus invoice: what is on the scale that has not been billed."""
+        tray = self.tray_weight()
+        return None if tray is None else tray - self.invoiced_weight()
+
     def _weight_ok(self) -> Optional[float]:
+        """The weight to bill for the item being added.
+
+        In cumulative mode the products stay on the tray, so a new item weighs
+        the difference between the scale and what the invoice already covers:
+        put 100 g on, bill it, add 200 g, and the scale reads 300 g while the
+        new line is 200 g.  That also means the tray and the invoice must agree
+        at all times, which is what makes a swapped or extra item visible.
+        """
         r = self.current_weight
         if r is not None and not r.stable and bool(self.settings.get("scale.stable_only", False)):
             self.status.showMessage(tr("weight_unstable"), 4000)
             return None
-        w = r.weight_kg if r else 0.0
-        if w < float(self.settings.get("scale.min_weight_kg", 0.005)):
+        tray = r.weight_kg if r else 0.0
+        minimum = float(self.settings.get("scale.min_weight_kg", 0.005))
+        if self.settings.get("pos.weighing_mode", "cumulative") == "cumulative":
+            w = tray - self.invoiced_weight()
+            if w < minimum:
+                self.status.showMessage(tr("nothing_new") if tray >= minimum else tr("zero_weight"), 4000)
+                return None
+            return w
+        if tray < minimum:
             self.status.showMessage(tr("zero_weight"), 4000)
             return None
-        return w
+        return tray
+
+    def _update_reconciliation(self):
+        """Show tray / invoice / new, and colour it when they disagree."""
+        decimals = int(self.settings.get("general.weight_decimals", 3))
+        tray, invoiced = self.tray_weight(), self.invoiced_weight()
+        if tray is None:
+            self.recon_lbl.setText("")
+            return
+        diff = tray - invoiced
+        tol = float(self.settings.get("pos.weight_tolerance_kg", 0.02))
+        text = (f"{tr('tray_weight')} {fmt_weight(tray, decimals)}"
+                f"   |   {tr('invoiced_weight')} {fmt_weight(invoiced, decimals)}")
+        colour = "#9aa3b5"
+        if not self.lines:
+            pass
+        elif abs(diff) <= tol:
+            text += f"   |   {tr('weight_matches')}"
+            colour = "#7CFC9A"
+        elif diff > 0:
+            text += f"   |   {tr('new_weight')} {fmt_weight(diff, decimals)}"
+            colour = "#ffd166"
+        else:
+            text += f"   |   {tr('weight_missing', diff=fmt_weight(-diff, decimals))}"
+            colour = "#ff8d8d"
+        self.recon_lbl.setText(text)
+        self.recon_lbl.setStyleSheet(f"color:{colour};font-size:14px")
 
     def add_detected(self):
         reason = self.blocking_reason()
@@ -2167,15 +2498,19 @@ class MainWindow(QMainWindow):
             return
         rec = self.current_rec
         active = self._active_detection()
-        if rec is None or active is None or not active.accepted or rec.empty:
+        chosen = self._override_item_id if (active is not None and
+                                            active.track_id == self._override_track) else None
+        if rec is None or active is None or rec.empty or (not active.accepted and not chosen):
             self.status.showMessage(tr("no_item_detected"), 4000)
             return
-        item = self.db.get(active.item_id)
+        item = self.db.get(chosen or active.item_id)
         if item is None:
             return
         w = self._weight_ok()
         if w is None:
             return
+        if chosen and chosen != active.item_id:
+            self._reinforce(item)        # the operator corrected us: learn this view
         qty = 1
         if self.settings.get("pos.multi_item_mode", "interlock") == "quantity":
             same = [d for d in rec.accepted if d.item_id == active.item_id]
@@ -2184,6 +2519,7 @@ class MainWindow(QMainWindow):
             if len(same) > 1 and not any(d.split for d in same):
                 qty = len(same)
         self._add_line(item, w, active.score, qty)
+        self._override_item_id = None
 
     def add_manual(self):
         iid = self.manual_combo.currentData()
@@ -2266,6 +2602,7 @@ class MainWindow(QMainWindow):
             btn.clicked.connect(lambda _=False, idx=r: self._delete_row(idx))
             self.table.setCellWidget(r, 4, btn)
         self._update_total()
+        self._update_reconciliation()
 
     def _update_total(self):
         total = sum(l.total for l in self.lines)
@@ -2312,6 +2649,22 @@ class MainWindow(QMainWindow):
         if not self.lines:
             self.status.showMessage(tr("invoice_empty"), 4000)
             return
+        # The tamper check: everything billed should still be on the tray and
+        # nothing else should be.  An extra unbilled item, or one swapped for a
+        # heavier one after scanning, shows up here as a weight that disagrees.
+        diff = self.weight_difference()
+        tol = float(self.settings.get("pos.weight_tolerance_kg", 0.02))
+        if (self.settings.get("pos.weighing_mode", "cumulative") == "cumulative"
+                and diff is not None and abs(diff) > tol):
+            decimals = int(self.settings.get("general.weight_decimals", 3))
+            text = tr("checkout_mismatch", diff=("+" if diff > 0 else "-") + fmt_weight(abs(diff), decimals))
+            log.warning("checkout weight mismatch: tray %.3f, invoice %.3f", self.tray_weight() or 0.0,
+                        self.invoiced_weight())
+            if self.settings.get("pos.block_checkout_on_mismatch", True):
+                if not ask(self, text + "\n\n" + tr("checkout_anyway")):
+                    return
+            else:
+                self.status.showMessage(text, 8000)
         number = self._next_invoice_number()
         inv = Invoice(number, list(self.lines), store_name=self.settings.get("general.store_name", ""),
                       currency=self.settings.get("general.currency", ""))
@@ -2334,6 +2687,7 @@ class MainWindow(QMainWindow):
 
         threading.Thread(target=work, name="Printer", daemon=True).start()
         self.lines.clear()
+        self._override_item_id = None
         self._refresh_table()
         self.inv_no_lbl.setText(f"{tr('invoice_no')} #{self._peek_invoice_number():06d}")
 
@@ -2405,6 +2759,27 @@ class MainWindow(QMainWindow):
             self._refresh_items_ui()
             msg_info(self, tr("tray_saved"))
         dlg.deleteLater()
+
+    def save_diagnostics(self):
+        """Package the frame, the masks, the crops and the scores into one zip.
+
+        Recognition faults depend entirely on what this particular camera sees
+        on this particular counter, so this is what turns "it does not detect
+        my goods" into something that can actually be diagnosed.
+        """
+        folder = app_dir()
+        path = diagnostics.default_path(folder)
+        try:
+            _fid, frame = self._camera_frame()
+            diagnostics.collect(path, frame, self.tray, self.db, self.engine, self.settings,
+                                self.current_rec, note=f"scale source: {self.scale_source}")
+        except Exception as exc:
+            log.exception("diagnostic bundle failed")
+            msg_error(self, str(exc))
+            return
+        size_kb = os.path.getsize(path) // 1024
+        self.status.showMessage(tr("diagnostics_saved", path=os.path.basename(path)), 10000)
+        msg_info(self, tr("diagnostics_saved", path=path) + f"  ({size_kb} KB)")
 
     def capture_empty_tray(self):
         if not self._require_engine() or self._bg_wanted or self._bg_frames:

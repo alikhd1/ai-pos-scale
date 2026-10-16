@@ -11,7 +11,7 @@ meaningful as regression gates rather than as claims about real accuracy.
 """
 from __future__ import annotations
 
-from typing import List, Optional, Sequence, Tuple
+from typing import List, Sequence, Tuple
 
 import cv2
 import numpy as np

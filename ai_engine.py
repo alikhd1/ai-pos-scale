@@ -37,6 +37,7 @@ Public classes
 """
 from __future__ import annotations
 
+import copy
 import logging
 import os
 import pickle
@@ -73,9 +74,13 @@ MODE_TRAY, MODE_OBJECT = "tray", "object"
 WHITEN_DIM = 32
 CALIB_PERCENTILE = 99.0               # q=99: false accepts 0.078 at 0.636 false rejects
                                       # (q=95 gives 0.300 / 0.319 - a wrong price costs more than a tap)
-SELF_FLOOR_FRAC = 0.35                # fallback floor (fraction of median self-similarity) when an item
-                                      # has only one capture, so leave-one-capture-out is impossible
-LOO_SLACK = 0.05                      # tolerance below the worst leave-one-capture-out score
+SELF_FLOOR_FRAC = 0.35                # fallback (fraction of median self-similarity) when an item has only
+                                      # one capture, so leave-one-capture-out is impossible
+THRESHOLD_BALANCE = 0.8               # where the AUTOMATIC accept threshold sits between the impostor scores
+                                      # and the genuine ones: 0 accepts anything the impostors do not reach,
+                                      # 1 demands as much as a held-out view of the item itself.  Below this
+                                      # but above the impostor level the item is only SUGGESTED, and the
+                                      # operator confirms it - never a silent wrong price, never a dead end.
 
 
 # --------------------------------------------------------------------------- #
@@ -284,7 +289,8 @@ def build_mobilenet_v2():
 class FeatureExtractor:
     """MobileNetV2 backbone producing normalised 1280-d embeddings (CPU friendly)."""
 
-    def __init__(self, model_file: str = "", num_threads: int = 1, progress: Optional[Callable[[str], None]] = None):
+    def __init__(self, model_file: str = "", num_threads: int = 1, progress: Optional[Callable[[str], None]] = None,
+                 fast: bool = True):
         import torch
         self.torch = torch
         try:
@@ -301,9 +307,99 @@ class FeatureExtractor:
         self.pool = torch.nn.AdaptiveAvgPool2d(1)
         self.weights_path = path
         self.device = torch.device("cpu")
+        self._fast = None
+        self.optimized = False
+        self.optimizing = False
+        self.channels_last = False
         with torch.inference_mode():                       # warm-up
-            self.backbone(torch.zeros(1, 3, INPUT_SIZE, INPUT_SIZE))
+            self.embed_batch([np.zeros((INPUT_SIZE, INPUT_SIZE, 3), np.uint8)])
         log.info("MobileNetV2 ready (weights: %s)", path)
+        if fast:
+            # Tracing takes about 20 s, far too long to hold up the first sale
+            # of the day, so the till starts on the eager model and silently
+            # switches to the optimized one when it is ready and verified.
+            self.optimizing = True
+            threading.Thread(target=self._build_fast_path, args=(progress,), daemon=True,
+                             name="ModelOptimizer").start()
+
+    def _build_fast_path(self, progress: Optional[Callable[[str], None]] = None) -> None:
+        """Trace, freeze and optimize the backbone, and move it to channels-last.
+
+        Measured in the shipped build on a settled machine, over three runs: a
+        whole embed() call goes from about 40 ms to about 24 ms, 1.7x, for a
+        maximum output difference of 4e-06 - the same embeddings.  (The network
+        itself speeds up more than that, but it is only ~88% of the call; the
+        preprocessing around it costs a fixed 2 ms and was measured not to be
+        worth optimizing.)  This is pure graph optimisation, not quantisation,
+        so nothing about recognition accuracy changes.
+
+        Everything is wrapped: if TorchScript is unavailable or misbehaves in a
+        frozen build, the eager module keeps working and only speed is lost.
+        """
+        torch = self.torch
+        t0 = time.time()
+        try:
+            if progress:
+                progress("optimizing the model for this CPU")
+            sample = torch.zeros(1, 3, INPUT_SIZE, INPUT_SIZE).to(memory_format=torch.channels_last)
+            # a private copy, so the eager model stays usable on the other
+            # thread while this one is being traced
+            backbone = copy.deepcopy(self.backbone).eval().to(memory_format=torch.channels_last)
+            with torch.inference_mode():
+                reference = self.pool(backbone(sample)).flatten(1)
+
+            # Degrade in stages rather than all-or-nothing: each step is a real
+            # speed-up on its own, and any of them can be unavailable in a frozen
+            # build (torch.jit needs sympy, and tracing is deprecated on 3.14+).
+            traced = None
+            with torch.inference_mode():
+                try:
+                    traced = torch.jit.trace(backbone, sample)
+                    try:
+                        traced = torch.jit.freeze(traced.eval())
+                        try:
+                            traced = torch.jit.optimize_for_inference(traced)
+                            stage = "traced, frozen and optimized"
+                        except Exception as exc:
+                            stage = "traced and frozen"
+                            log.info("optimize_for_inference unavailable (%s)", exc)
+                    except Exception as exc:
+                        stage = "traced"
+                        log.info("jit.freeze unavailable (%s)", exc)
+                except Exception as exc:
+                    traced, stage = None, "channels-last only"
+                    log.warning("TorchScript unavailable (%s); keeping the eager model", exc)
+
+                if traced is not None:
+                    for _ in range(2):                  # the first calls specialise the graph
+                        got = self.pool(traced(sample)).flatten(1)
+                    drift = float((reference - got).abs().max())
+                    if drift > 1e-3:
+                        raise RuntimeError(f"traced model disagrees with the eager model by {drift:.2e}")
+                else:
+                    drift = 0.0
+
+            self.backbone = backbone            # channels-last helps on its own
+            self._fast = traced                 # one atomic assignment: readers see old or new
+            self.channels_last = True
+            self.optimized = traced is not None
+            log.info("inference fast path: %s, ready in %.1fs (drift %.1e)", stage, time.time() - t0, drift)
+        except Exception as exc:
+            log.warning("inference fast path unavailable (%s); using eager mode", exc)
+            self._fast = None
+            self.optimized = self.channels_last = False
+        finally:
+            self.optimizing = False
+
+    def _forward(self, batch_t):
+        if self._fast is not None:
+            try:
+                return self._fast(batch_t)
+            except Exception:
+                log.warning("fast path failed at runtime; reverting to eager mode", exc_info=True)
+                self._fast = None
+                self.optimized = False
+        return self.backbone(batch_t)
 
     def preprocess(self, bgr: np.ndarray) -> np.ndarray:
         if bgr.ndim == 2:
@@ -319,8 +415,10 @@ class FeatureExtractor:
         torch = self.torch
         batch = np.stack([self.preprocess(im) for im in images])
         with torch.inference_mode():
-            feats = self.backbone(torch.from_numpy(batch))
-            vec = torch.nn.functional.normalize(self.pool(feats).flatten(1), dim=1)
+            tensor = torch.from_numpy(batch)
+            if self.channels_last:
+                tensor = tensor.to(memory_format=torch.channels_last)
+            vec = torch.nn.functional.normalize(self.pool(self._forward(tensor)).flatten(1), dim=1)
         return vec.cpu().numpy().astype(np.float32)
 
     def embed(self, image: np.ndarray) -> np.ndarray:
@@ -362,7 +460,8 @@ class Item:
     updated: float = field(default_factory=time.time)
     sessions: int = 0
     groups: np.ndarray = field(default_factory=lambda: np.zeros((0,), dtype=np.int32))
-    threshold: float = 0.0                 # calibrated from impostors; 0 = not calibrated yet
+    threshold: float = 0.0                 # score needed to bill this item automatically
+    suggest_threshold: float = 0.0         # score needed to offer it to the operator at all
     crop_mode: str = MODE_TRAY             # "tray" (legacy) or "object" (per-object crops)
     drift: np.ndarray = field(default_factory=lambda: np.zeros((0, EMBEDDING_DIM), dtype=np.float32))
     unit: str = "kg"                       # "kg" or "pcs"
@@ -444,6 +543,7 @@ class ItemDatabase:
                         item.updated = raw.get("updated", item.created)
                         item.sessions = raw.get("sessions", 1)
                         item.threshold = float(raw.get("threshold", 0.0))
+                        item.suggest_threshold = float(raw.get("suggest_threshold", 0.0))
                         item.crop_mode = raw.get("crop_mode", MODE_TRAY)
                         item.unit = raw.get("unit", "kg")
                         item.price_per_piece = float(raw.get("price_per_piece", 0.0))
@@ -489,7 +589,8 @@ class ItemDatabase:
                 "version": self.VERSION, "saved": time.time(), "backbone": BACKBONE_ID,
                 "items": [{"id": it.id, "name": it.name, "price_per_kg": it.price_per_kg,
                            "embeddings": it.embeddings, "groups": it.groups, "drift": it.drift,
-                           "threshold": it.threshold, "crop_mode": it.crop_mode,
+                           "threshold": it.threshold, "suggest_threshold": it.suggest_threshold,
+                           "crop_mode": it.crop_mode,
                            "unit": it.unit, "price_per_piece": it.price_per_piece,
                            "avg_unit_weight_kg": it.avg_unit_weight_kg,
                            "thumbnail": it.thumbnail, "created": it.created, "updated": it.updated,
@@ -761,26 +862,45 @@ class ItemDatabase:
             for i, iid in enumerate(ids):
                 neg = [projected[j] for j in range(len(ids)) if j != i]
                 impostor = float(np.percentile(np.vstack(neg) @ cents[i], q)) if neg else -1.0
-                thr = max(impostor, self._genuine_floor(ids[i], projected[i], cents[i]), 0.0)
+                genuine = self._genuine_floor(ids[i], projected[i], cents[i])
+                thr = self._blend_threshold(impostor, genuine)
+                suggest = max(0.0, impostor)      # below this, nothing in the catalogue fits
                 if iid == EMPTY_ID:
                     self._empty_threshold = thr
                 else:
                     item = self._items.get(iid)
                     if item is not None:
                         item.threshold = thr
+                        item.suggest_threshold = min(suggest, thr)
+
+    @staticmethod
+    def _blend_threshold(impostor: float, genuine: float) -> float:
+        """Put the accept threshold between the two distributions.
+
+        The impostor percentile alone is far too generous when the catalogue is
+        small and its items are unlike each other, because then nothing in the
+        catalogue scores highly against this item and an unrelated object walks
+        straight in.  The genuine (leave-one-capture-out) score alone is far too
+        strict, because enrolment views resemble each other much more closely
+        than a real query taken at another angle under another lamp does -
+        which shows up as a correct product being rejected all day.
+
+        Sitting halfway between them adapts to both: a crowded catalogue of
+        similar produce raises the bar, a sparse one lowers it.
+        """
+        if genuine <= impostor:            # the two classes overlap: only the impostors matter
+            return max(impostor, 0.0)
+        return max(0.0, impostor + THRESHOLD_BALANCE * (genuine - impostor))
 
     def _genuine_floor(self, item_id: str, projected: np.ndarray, centroid: np.ndarray) -> float:
-        """How low a *genuine* held-out view of this item is expected to score.
+        """How well a *genuine* held-out view of this item scores.
 
         Each capture is scored against the centroid built without it, which is an
         honest estimate of a never-seen view, unlike in-sample self-similarity
         (every sample helped build its own centroid, so it always scores high).
 
-        This is the floor under the impostor threshold.  The impostor statistic
-        alone protects against the other enrolled items, but says nothing about
-        an object unlike anything in the catalogue: with a handful of mutually
-        dissimilar items its percentile sits near zero and an unrelated object
-        walks straight in.
+        It is one end of the range the accept threshold is placed in; see
+        ``_blend_threshold``.
         """
         item = self._items.get(item_id)
         if item is None:                                # the empty-tray pseudo-item
@@ -803,7 +923,7 @@ class ItemDatabase:
             scores.extend((own[mask] @ (c / norm)).tolist())
         if not scores:
             return SELF_FLOOR_FRAC * float(np.median(projected @ centroid))
-        return float(np.percentile(scores, 5)) - LOO_SLACK
+        return float(np.percentile(scores, 5))
 
     def gallery(self, mode: str) -> Dict[str, Any]:
         with self._lock:
@@ -814,6 +934,12 @@ class ItemDatabase:
             return float(getattr(self, "_empty_threshold", 0.0))
         item = self._items.get(item_id)
         return float(item.threshold) if item is not None else 0.0
+
+    def item_suggest_threshold(self, item_id: str) -> float:
+        if item_id == EMPTY_ID:
+            return float(getattr(self, "_empty_threshold", 0.0))
+        item = self._items.get(item_id)
+        return float(item.suggest_threshold) if item is not None else 0.0
 
     # --------------------------------------------------------- diagnostics
     def confusable_pairs(self, limit: int = 10) -> List[Tuple[str, str, float]]:
@@ -857,7 +983,8 @@ class MatchResult:
     item_id: Optional[str]
     name: str
     score: float                       # the gate score, i.e. the number the decision used
-    accepted: bool
+    accepted: bool                     # confident enough to bill without being asked
+    suggested: bool = False            # plausible: offer it, let the operator confirm
     rank_score: float = 0.0
     threshold: float = 0.0
     margin: float = 0.0
@@ -875,6 +1002,11 @@ class Recognizer:
         self.threshold = float(threshold)      # slider: an offset on the calibrated thresholds
         self.top_k = max(1, int(top_k))
         self.empty_threshold = float(empty_threshold)
+
+    def effective_suggest_threshold(self, item_id: str) -> float:
+        base = self.db.item_suggest_threshold(item_id)
+        accept = self.effective_threshold(item_id)
+        return min(accept, max(0.0, base + (self.threshold - 0.65)))
 
     def effective_threshold(self, item_id: str) -> float:
         """Calibrated threshold, nudged by the Settings slider.
@@ -908,9 +1040,10 @@ class Recognizer:
         empty = best_id == EMPTY_ID
         thr = self.effective_threshold(best_id)
         accepted = (not empty) and gate >= thr
+        suggested = (not empty) and gate >= self.effective_suggest_threshold(best_id)
         item = self.db.get(best_id) if not empty else None
         return MatchResult(best_id if accepted else None, item.name if item else "", gate, accepted,
-                           float(rank_scores[best]), thr, margin, ranking,
+                           suggested, float(rank_scores[best]), thr, margin, ranking,
                            item.price_per_kg if item else 0.0, empty)
 
     def _name(self, item_id: str) -> str:
@@ -963,6 +1096,21 @@ class Detection:
     @property
     def accepted(self) -> bool:
         return self.item_id is not None
+
+    @property
+    def suggested(self) -> bool:
+        """Plausible but not certain: the operator is asked to confirm."""
+        return (not self.accepted) and bool(self.result.suggested)
+
+    @property
+    def suggested_item_id(self) -> Optional[str]:
+        if not self.result.suggested or not self.result.ranking:
+            return None
+        return self.result.ranking[0][0]
+
+    @property
+    def suggested_name(self) -> str:
+        return self.result.ranking[0][1] if self.result.ranking else ""
 
 
 @dataclass

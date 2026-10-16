@@ -98,6 +98,7 @@ python -m PyInstaller --noconfirm --clean --log-level WARN ^
     --add-data "models;models" ^
     --add-data "README.md;." ^
     --hidden-import torch ^
+    --hidden-import sympy ^
     --hidden-import serial ^
     --hidden-import serial.tools.list_ports ^
     --hidden-import serial.win32 ^
@@ -126,7 +127,6 @@ python -m PyInstaller --noconfirm --clean --log-level WARN ^
     --exclude-module pytest ^
     --exclude-module scipy ^
     --exclude-module pandas ^
-    --exclude-module sympy ^
     --exclude-module onnx ^
     --exclude-module tensorboard ^
     app.py

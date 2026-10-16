@@ -1,14 +1,14 @@
-"""
+﻿"""
 scale_driver.py
 ---------------
 RS-232 weighing-scale reader for the AI POS Scale.
 
-* ``ScaleReader``     – background thread reading a serial port (pyserial),
+* ``ScaleReader``     â€“ background thread reading a serial port (pyserial),
                         splitting frames (CR/LF/ETX, STX or idle gap), parsing
                         weights, counting bytes/frames/readings for diagnostics
                         and reconnecting automatically.
-* ``SimulatedScale``  – drop-in replacement driven by a slider in the UI.
-* ``parse_weight()``  – protocol-agnostic parser for the common indicator
+* ``SimulatedScale``  â€“ drop-in replacement driven by a slider in the UI.
+* ``parse_weight()``  â€“ protocol-agnostic parser for the common indicator
                         formats, e.g.::
 
         ST,GS,+  1.234kg\\r\\n      (CAS / A&D / Ohaus style continuous output)
@@ -19,7 +19,10 @@ RS-232 weighing-scale reader for the AI POS Scale.
         \\x02  1.234\\r            (STX framed)
         001234 (implied decimals = 3)
 
-* ``diagnose_scale()`` – opens the port, listens, and if nothing usable arrives
+* ``find_scale()``    â€“ searches USB HID scales AND every COM port / baud rate /
+                        request command, and reports what answered.
+* ``make_scale()``    â€“ builds the scale object a configuration describes.
+* ``diagnose_scale()`` â€“ opens the port, listens, and if nothing usable arrives
                         tries the other baud rates / parities and the common
                         request commands.  Produces a text report the operator
                         can paste into a support request.
@@ -607,6 +610,209 @@ def diagnose_scale(config: Dict, progress: Optional[Callable[[str], None]] = Non
         say("    -> Check: scale in 'continuous'/'stream' output mode? RX/TX crossed (null-modem) cable? correct COM port?")
     return {"ok": False, "summary": "no usable data on any setting", "report": "\n".join(lines), "suggestion": None}
 
+
+
+# --------------------------------------------------------------------------- #
+# Scale source resolution and the "find my scale" search
+# --------------------------------------------------------------------------- #
+SOURCE_AUTO, SOURCE_SERIAL, SOURCE_HID, SOURCE_SIMULATE = "auto", "serial", "hid", "simulate"
+# the baud rates worth trying first, in the order real indicators actually use
+BAUD_ORDER = [9600, 19200, 2400, 4800, 38400, 115200, 1200, 57600]
+
+
+def resolve_source(config: Dict) -> Tuple[str, str]:
+    """Decide which kind of scale a configuration means, and say why.
+
+    Returns (source, reason).  ``auto`` prefers a USB HID scale, then a
+    configured COM port, then the simulator - so plugging a HID scale in is
+    enough to make it work, with nothing to configure.
+    """
+    if not config.get("enabled", True):
+        return SOURCE_SIMULATE, "scale.enabled = false"
+    source = str(config.get("source") or "").strip().lower()
+    if not source:                                   # configuration written before source existed
+        source = SOURCE_SIMULATE if config.get("simulate") else SOURCE_AUTO
+    port = (config.get("port") or "").strip()
+    if source == SOURCE_SIMULATE:
+        return SOURCE_SIMULATE, "simulation is selected" + (f" (port {port} ignored)" if port else "")
+    if source == SOURCE_HID:
+        return SOURCE_HID, "USB HID scale is selected"
+    if source == SOURCE_SERIAL:
+        if not port:
+            return SOURCE_SIMULATE, "serial is selected but no COM port is set"
+        return SOURCE_SERIAL, f"serial {port} @ {config.get('baudrate')}"
+    # auto
+    try:
+        from hid_scale import list_hid_scales
+        if list_hid_scales():
+            return SOURCE_HID, "auto: a USB HID scale is connected"
+    except Exception:
+        pass
+    if port:
+        return SOURCE_SERIAL, f"auto: serial {port} @ {config.get('baudrate')}"
+    return SOURCE_SIMULATE, "auto: no HID scale and no COM port configured"
+
+
+def make_scale(config: Dict) -> BaseScale:
+    """Build the scale object a configuration describes."""
+    source, _reason = resolve_source(config)
+    if source == SOURCE_HID:
+        from hid_scale import HidScaleReader
+        return HidScaleReader(config)
+    if source == SOURCE_SERIAL:
+        return ScaleReader(config)
+    return SimulatedScale(0.0)
+
+
+def find_scale(progress: Optional[Callable[[str], None]] = None, deep: bool = True,
+               should_stop: Optional[Callable[[], bool]] = None) -> Dict:
+    """Search every way a scale can be attached and report what answered.
+
+    Stage 1 USB HID scales.  Stage 2 every COM port at the common baud rates.
+    Stage 3 parity variants for ports that produced garbage.  Stage 4 request
+    commands for ports that stayed silent.
+
+    Returns {"found": bool, "best": {...} | None, "candidates": [...], "report": str}.
+    Each candidate carries a ready-to-apply ``config`` patch.
+    """
+    lines: List[str] = []
+    candidates: List[Dict] = []
+
+    def say(text: str):
+        lines.append(text)
+        if progress:
+            progress(text)
+
+    def stop() -> bool:
+        return bool(should_stop and should_stop())
+
+    # ---- stage 1: USB HID -------------------------------------------------
+    say("[1] USB HID scales")
+    try:
+        from hid_scale import list_hid_devices, test_hid_scale
+        all_hid = list_hid_devices()
+        scales = [d for d in all_hid if d.is_scale]
+        say(f"    {len(all_hid)} HID devices present, {len(scales)} on the scale usage page")
+        for d in all_hid:
+            say(f"      {'SCALE  ' if d.is_scale else '       '}{d}")
+        for d in scales:
+            if stop():
+                break
+            say(f"    listening to {d.product or d.path[:40]} ...")
+            res = test_hid_scale(d.path, 3.0)
+            for raw in res.get("raw", [])[:4]:
+                say(f"      {raw}")
+            if res["ok"]:
+                say(f"    -> HID scale works: {res['message']}")
+                candidates.append({"source": SOURCE_HID, "label": f"USB HID: {d.product or 'scale'}",
+                                   "weight": res["reading"].weight_kg, "score": 100,
+                                   "config": {"source": SOURCE_HID, "hid_path": d.path, "simulate": False,
+                                              "enabled": True}})
+            else:
+                say(f"    -> {res['message']}")
+    except Exception as exc:
+        say(f"    HID search failed: {exc}")
+
+    # ---- stage 2: serial, every port and the common baud rates ------------
+    ports = list_serial_ports()
+    say(f"[2] serial ports: {', '.join(d for d, _ in ports) if ports else 'none found'}")
+    garbage: List[Tuple[str, int]] = []
+    silent: List[str] = []
+    for dev, desc in ports:
+        if stop():
+            break
+        say(f"    {dev} ({desc})")
+        saw_bytes = False
+        for baud in BAUD_ORDER:
+            if stop():
+                break
+            cfg = {"port": dev, "baudrate": baud, "bytesize": 8, "parity": "N", "stopbits": 1,
+                   "unit": "auto", "implied_decimals": 0, "number_index": 0}
+            raw, frames, readings, err = _listen(cfg, 1.0)
+            if err:
+                say(f"      {baud}: {err}")
+                break                                  # the port itself is unusable
+            if readings:
+                r = readings[-1]
+                say(f"      {baud}: WEIGHT {r.weight_kg:.3f} kg   '{r.raw}'")
+                candidates.append({"source": SOURCE_SERIAL, "label": f"{dev} @ {baud} 8N1",
+                                   "weight": r.weight_kg, "score": 90,
+                                   "config": dict(cfg, source=SOURCE_SERIAL, simulate=False, enabled=True)})
+                break
+            if raw:
+                saw_bytes = True
+                kind = "text" if _looks_like_text(raw) else "garbage"
+                say(f"      {baud}: {len(raw)} bytes of {kind}: {printable(raw, 24)}")
+                if kind == "garbage":
+                    garbage.append((dev, baud))
+                else:
+                    # readable text that the parser could not turn into a number
+                    candidates.append({"source": SOURCE_SERIAL, "label": f"{dev} @ {baud} (unparsed text)",
+                                       "weight": None, "score": 40,
+                                       "config": dict(cfg, source=SOURCE_SERIAL, simulate=False, enabled=True)})
+                break
+        if not saw_bytes and not any(c["config"].get("port") == dev for c in candidates):
+            silent.append(dev)
+
+    if deep and not any(c["score"] >= 90 for c in candidates):
+        # ---- stage 3: parity variants where bytes arrived -----------------
+        if garbage:
+            say("[3] parity and data-bit variants where bytes arrived")
+            for dev, baud in garbage[:3]:
+                for bits, par in ((7, "E"), (7, "O"), (8, "E")):
+                    if stop():
+                        break
+                    cfg = {"port": dev, "baudrate": baud, "bytesize": bits, "parity": par, "stopbits": 1,
+                           "unit": "auto", "implied_decimals": 0, "number_index": 0}
+                    _raw, _f, readings, err = _listen(cfg, 1.0)
+                    if err:
+                        continue
+                    if readings:
+                        r = readings[-1]
+                        say(f"    {dev} {baud} {bits}{par}1: WEIGHT {r.weight_kg:.3f} kg")
+                        candidates.append({"source": SOURCE_SERIAL, "label": f"{dev} @ {baud} {bits}{par}1",
+                                           "weight": r.weight_kg, "score": 85,
+                                           "config": dict(cfg, source=SOURCE_SERIAL, simulate=False, enabled=True)})
+                        break
+                    say(f"    {dev} {baud} {bits}{par}1: nothing usable")
+
+        # ---- stage 4: request commands for silent ports -------------------
+        if silent:
+            say("[4] request commands on silent ports")
+            for dev in silent[:3]:
+                for baud in (9600, 19200):
+                    for cmd, label in POLL_CANDIDATES:
+                        if stop():
+                            break
+                        cfg = {"port": dev, "baudrate": baud, "bytesize": 8, "parity": "N", "stopbits": 1,
+                               "poll_command": cmd, "unit": "auto", "implied_decimals": 0, "number_index": 0}
+                        _raw, _f, readings, err = _listen(cfg, 0.8, decode_escapes(cmd), 0.3)
+                        if err:
+                            break
+                        if readings:
+                            r = readings[-1]
+                            say(f"    {dev} @ {baud} + {label}: WEIGHT {r.weight_kg:.3f} kg")
+                            candidates.append({"source": SOURCE_SERIAL,
+                                               "label": f"{dev} @ {baud} 8N1 + {label}",
+                                               "weight": r.weight_kg, "score": 80,
+                                               "config": dict(cfg, source=SOURCE_SERIAL, simulate=False,
+                                                              enabled=True)})
+                            break
+                    if any(c["config"].get("port") == dev and c["score"] >= 80 for c in candidates):
+                        break
+
+    candidates.sort(key=lambda c: c["score"], reverse=True)
+    best = candidates[0] if candidates else None
+    if best and best["score"] >= 80:
+        say(f"RESULT: {best['label']}" + (f" reading {best['weight']:.3f} kg" if best["weight"] is not None else ""))
+    elif best:
+        say(f"RESULT: something answered on {best['label']} but the weight could not be parsed. "
+            f"Send this report so a parser rule can be added.")
+    else:
+        say("RESULT: nothing answered. Check that the scale is powered, that its cable is plugged into "
+            "this PC, and that no other program is holding the port.")
+    return {"found": bool(best and best["score"] >= 80), "best": best, "candidates": candidates,
+            "report": "\n".join(lines)}
 
 if __name__ == "__main__":
     samples = [b"ST,GS,+  1.234kg\r\n", b"US,GS,   0.000kg\r\n", b"+001.234 kg\r", b"   2.500 kg\r\n",
