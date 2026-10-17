@@ -98,6 +98,11 @@ try:
     print("\n[1] setup")
     wait(lambda: win.engine is not None, 240, "model loads")
     win.engine.get_frame = cam.get
+    # this test scripts its own frames, so the window is told it has a camera:
+    # a window with no camera correctly stops recognising (see test_no_camera.py)
+    wait(lambda: win.camera_result is not None, 30, "camera opener finishes")
+    win.camera_ok = True
+    win.engine.paused = False
     win.capture_empty_tray()
     wait(lambda: win.db.has_background_image, 60, "empty tray captured")
     check("segmenter live", win.engine.has_segmenter)

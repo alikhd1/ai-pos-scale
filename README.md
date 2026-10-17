@@ -147,6 +147,21 @@ Latin receipts. Transports: any Windows printer (RAW spool) or a serial COM prin
 
 ## Troubleshooting
 
+* **The screen says "No camera".** The till stays usable: it drops into manual mode, the
+  banner says so, and you can still pick a product from the list and weigh it. Press
+  *Try the camera again* next to the pill - it tries every device index on the machine,
+  and every picture format, and saves the one that works.
+* **The camera "opens but no frames".** That is a camera that answers Windows but will not
+  deliver the picture format it was asked for, usually because MJPEG was forced on a camera
+  that only does YUY2. The app now tries the device's own format first and only then the
+  alternatives, so this should be gone; if it comes back, `AIPosScale.exe --selftest` lists
+  every combination it tried, and which device indexes exist.
+* **"cameras Windows can see: NONE" in the self-test.** Then the problem is below the app:
+  the camera is unplugged, has no driver, or is not a standard USB camera at all. Check
+  Device Manager first - nothing in the app can fix a camera Windows cannot see.
+* **The scale says "Simulated" and there is no COM port set.** Press *Find my scale* under
+  the weight. It tries every USB HID scale and every COM port at the usual baud rates, and
+  applies whatever answers.
 * **The scale is connected and the test says OK, but no weight appears.** Look at the
   status pill under the weight. `Simulated (COM3: simulation is ON...)` in amber means the
   app is on the simulator: press *Use the real scale COM3*. `Connected, no data` means the

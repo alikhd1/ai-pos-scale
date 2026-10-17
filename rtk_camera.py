@@ -55,11 +55,12 @@ import ctypes.util
 import logging
 import os
 import struct
+import subprocess
 import sys
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Callable, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -562,47 +563,112 @@ class OpenCVCameraSource(CameraSource):
     def __init__(self, device_index: int = 0, width: int = 640, height: int = 480, video_file: str = ""):
         self.device_index, self.width, self.height, self.video_file = device_index, width, height, video_file
         self.cap: Optional["cv2.VideoCapture"] = None
+        self.attempts: List[str] = []
         self._is_file = bool(video_file)
         self._lock = threading.Lock()
 
     def _backends(self) -> List[Tuple[str, int]]:
         if self._is_file:
             return [("FFMPEG", cv2.CAP_FFMPEG), ("ANY", cv2.CAP_ANY)]
-        major = int(cv2.__version__.split(".")[0])
         if sys.platform.startswith("win"):
-            # OpenCV 5 can no longer open devices by index through DirectShow
-            order = [("DSHOW", cv2.CAP_DSHOW), ("MSMF", cv2.CAP_MSMF)] if major < 5 else [("MSMF", cv2.CAP_MSMF)]
-            return order + [("ANY", cv2.CAP_ANY)]
-        return [("ANY", cv2.CAP_ANY)]
+            # DSHOW is tried even on OpenCV 5, where opening by index is not
+            # guaranteed: when it does work it is the most compatible path for
+            # the cheap UVC modules these terminals ship with, and when it does
+            # not it fails instantly and costs nothing.
+            return [("MSMF", cv2.CAP_MSMF), ("DSHOW", cv2.CAP_DSHOW), ("ANY", cv2.CAP_ANY)]
+        return [("ANY", cv2.CAP_ANY), ("V4L2", getattr(cv2, "CAP_V4L2", cv2.CAP_ANY))]
 
-    def open(self) -> None:
+    def _attempts(self) -> List[Tuple[str, Optional[int], Optional[int], Optional[str]]]:
+        """Property combinations to try, most compatible first.
+
+        Forcing a resolution or a pixel format the device does not support is a
+        classic way to get a camera that opens and then never delivers a frame,
+        which is indistinguishable from a broken camera.  So the first attempt
+        changes nothing at all and simply takes whatever the device offers.
+        """
+        out: List[Tuple[str, Optional[int], Optional[int], Optional[str]]] = [("as the device comes", None, None, None)]
+        if self.width and self.height:
+            out.append((f"{self.width}x{self.height}", self.width, self.height, None))
+            out.append((f"MJPG {self.width}x{self.height}", self.width, self.height, "MJPG"))
+            out.append((f"YUY2 {self.width}x{self.height}", self.width, self.height, "YUY2"))
+        for w, h in ((640, 480), (1280, 720), (320, 240)):
+            if (w, h) != (self.width, self.height):
+                out.append((f"{w}x{h}", w, h, None))
+        out.append(("MJPG, device resolution", None, None, "MJPG"))
+        return out
+
+    @staticmethod
+    def _first_frame(cap, seconds: float = 3.0):
+        """Wait for a frame.  Some UVC modules need a second or two to start."""
+        deadline = time.time() + seconds
+        while time.time() < deadline:
+            ok, frame = cap.read()
+            if ok and frame is not None and frame.size:
+                return frame
+            time.sleep(0.03)
+        return None
+
+    def open(self, budget: float = 14.0) -> None:
+        """Open the camera, trying combinations until one delivers a picture.
+
+        The search is bounded: seven combinations across three backends, each
+        waiting seconds for a first frame, would otherwise take a minute on a
+        till that simply has no camera, and the app would look hung.
+        """
         if cv2 is None:
             raise RuntimeError("opencv-python is not installed")
-        errors = []
+        self.attempts: List[str] = []
+        give_up_at = time.time() + budget
         for label, backend in self._backends():
-            cap = cv2.VideoCapture(self.video_file if self._is_file else int(self.device_index), backend)
-            if not cap.isOpened():
+            if self._is_file:
+                cap = cv2.VideoCapture(self.video_file, backend)
+                if not cap.isOpened():
+                    cap.release()
+                    self.attempts.append(f"{label}: not opened")
+                    continue
+                frame = self._first_frame(cap, 4.0)
+                if frame is not None:
+                    self._adopt(cap, label, "file")
+                    return
                 cap.release()
-                errors.append(f"{label}: not opened")
+                self.attempts.append(f"{label}: opened but no frames")
                 continue
-            if not self._is_file:
-                cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
-                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
-                cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-            ok, frame = False, None
-            deadline = time.time() + 4.0
-            while time.time() < deadline and not ok:
-                ok, frame = cap.read()
-            if ok and frame is not None:
-                self.cap = cap
-                w, h = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-                src = os.path.basename(self.video_file) if self._is_file else f"device {self.device_index}"
-                self.description = f"OpenCV/{label} – {src} {w}x{h}"
-                log.info("camera opened: %s", self.description)
-                return
-            cap.release()
-            errors.append(f"{label}: opened but no frames")
-        raise RuntimeError("OpenCV could not open camera (" + "; ".join(errors) + ")")
+
+            for attempt_no, (name, w, h, fourcc) in enumerate(self._attempts()):
+                if time.time() > give_up_at:
+                    self.attempts.append("gave up: no combination produced a picture in time")
+                    break
+                cap = cv2.VideoCapture(int(self.device_index), backend)
+                if not cap.isOpened():
+                    cap.release()
+                    self.attempts.append(f"{label}: device {self.device_index} would not open")
+                    break                       # the backend cannot open it at all
+                try:
+                    if fourcc:
+                        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*fourcc))
+                    if w and h:
+                        cap.set(cv2.CAP_PROP_FRAME_WIDTH, w)
+                        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
+                except Exception as exc:
+                    self.attempts.append(f"{label} / {name}: setting properties failed ({exc})")
+                # the first try waits long enough for a slow UVC module to start;
+                # after that the device is known to start, so a short wait is enough
+                frame = self._first_frame(cap, 3.0 if attempt_no == 0 else 1.2)
+                if frame is not None:
+                    self._adopt(cap, label, name)
+                    return
+                cap.release()
+                self.attempts.append(f"{label} / {name}: opened but no frames")
+            if time.time() > give_up_at:
+                break
+        raise RuntimeError("OpenCV could not open camera (" + "; ".join(self.attempts[:8]) + ")")
+
+    def _adopt(self, cap, label: str, how: str) -> None:
+        self.cap = cap
+        w, h = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        src = os.path.basename(self.video_file) if self._is_file else f"device {self.device_index}"
+        self.description = f"OpenCV/{label} - {src} {w}x{h} ({how})"
+        log.info("camera opened: %s", self.description)
 
     def read(self) -> Optional[np.ndarray]:
         with self._lock:
@@ -657,6 +723,42 @@ class NullCameraSource(CameraSource):
     def resolution(self) -> Tuple[int, int]:
         return (self.width, self.height)
 
+
+
+def find_camera(max_index: int = 6, progress: Optional[Callable[[str], None]] = None) -> Dict[str, Any]:
+    """Try every device index until one actually delivers a frame.
+
+    "Opens but no frames" is the usual failure on these terminals, so this
+    reports what was tried rather than a single yes/no.
+    """
+    def say(text: str):
+        if progress:
+            progress(text)
+
+    report: List[str] = []
+    for index in range(max_index):
+        say(f"trying device {index} ...")
+        source = OpenCVCameraSource(index, 640, 480)
+        try:
+            source.open(budget=8.0)
+        except Exception as exc:
+            report.append(f"device {index}: no")
+            for line in source.attempts[:4]:
+                report.append(f"    {line}")
+            del exc
+            continue
+        frame = source.read()
+        description, attempts = source.description, list(source.attempts)
+        source.close()
+        if frame is not None:
+            report.append(f"device {index}: WORKS - {description}")
+            say(report[-1])
+            return {"found": True, "index": index, "description": description,
+                    "report": "\n".join(report), "attempts": attempts}
+        report.append(f"device {index}: opened but produced nothing")
+    say("no camera answered")
+    return {"found": False, "index": None, "description": "",
+            "report": "\n".join(report), "attempts": []}
 
 @dataclass
 class CameraOpenResult:
@@ -790,6 +892,21 @@ class CameraThread(threading.Thread):
 # --------------------------------------------------------------------------- #
 # Diagnostics
 # --------------------------------------------------------------------------- #
+def windows_imaging_devices() -> List[str]:
+    """What Windows thinks is plugged in, as Device Manager would show it."""
+    if not sys.platform.startswith("win"):
+        return []
+    script = ("Get-PnpDevice -Class Camera,Image,Media -ErrorAction SilentlyContinue | "
+              "ForEach-Object { \"$($_.Status)`t$($_.FriendlyName)`t$($_.InstanceId)\" }")
+    try:
+        out = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+                             capture_output=True, text=True, timeout=25,
+                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except Exception as exc:
+        return [f"could not ask Windows: {exc}"]
+    return [ln.strip() for ln in out.stdout.splitlines() if ln.strip()]
+
+
 def diagnose(dll: str = "RTKCamSDK.dll") -> str:
     """Human readable summary of what the camera layer can do on this machine."""
     lines = [f"Python: {sys.version.split()[0]} ({'32' if process_is_32bit() else '64'}-bit)"]
@@ -808,6 +925,13 @@ def diagnose(dll: str = "RTKCamSDK.dll") -> str:
         except RTKCamError as exc:
             lines.append(f"RTKCam SDK unusable in this process: {exc}")
     lines.append(f"OpenCV: {cv2.__version__ if cv2 else 'missing'}")
+    devices = windows_imaging_devices()
+    if devices:
+        lines.append("cameras Windows can see:")
+        lines += [f"  {d}" for d in devices]
+    else:
+        lines.append("cameras Windows can see: NONE - the camera is either unplugged, has no driver, "
+                     "or is not a standard USB camera (in which case only the vendor SDK can drive it)")
     return "\n".join(lines)
 
 

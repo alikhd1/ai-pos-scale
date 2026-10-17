@@ -175,7 +175,7 @@ def scale_is_simulated(settings: SettingsManager) -> bool:
 # Head-less self-test (also used by build.bat and on the target machine)
 # --------------------------------------------------------------------------- #
 def run_selftest(settings: SettingsManager, video_file: str = "") -> int:
-    from rtk_camera import diagnose, open_camera
+    from rtk_camera import diagnose, open_camera, find_camera
     from scale_driver import parse_weight, list_serial_ports, diagnose_scale
     from printer_driver import ReceiptPrinter, Invoice, InvoiceLine, list_windows_printers
     from ai_engine import FeatureExtractor, ItemDatabase, Recognizer, TrayRegion, MODE_OBJECT, MODE_TRAY
@@ -216,7 +216,21 @@ def run_selftest(settings: SettingsManager, video_file: str = "") -> int:
     while frame is None and time.time() < deadline:
         frame = res.source.read()
     res.source.close()
-    lines.append(f"frame: {'OK ' + str(frame.shape) if frame is not None else 'NONE'}")
+    # the placeholder picture the app shows when there is no camera is still a
+    # frame, so reporting "frame: OK" for it would hide exactly the fault we
+    # are looking for
+    live = frame is not None and res.backend != "none"
+    lines.append(f"frame: {'OK ' + str(frame.shape) if live else 'NONE (no camera)'}")
+    if not live:
+        # the useful question on a dead camera is not "did it fail" but "what
+        # was tried and is the camera on a different index"
+        lines.append("no picture on the configured camera, searching every device index:")
+        found = find_camera()
+        lines += [f"  {line}" for line in found["report"].splitlines()]
+        if found["found"]:
+            lines.append(f"  >>> set camera.device_index to {found['index']} (or press "
+                         f"\"{tr('find_camera')}\" on the main screen)")
+        ok = False
     tray = TrayRegion.from_settings(cam)
     lines.append(f"tray area: {'polygon with ' + str(len(tray.points)) + ' points' if tray.is_polygon else 'default centre square'}, mask={tray.mask_outside}")
 
@@ -227,7 +241,7 @@ def run_selftest(settings: SettingsManager, video_file: str = "") -> int:
         # idle CPU; measuring while the optimizer thread runs flatters the result
         fx = FeatureExtractor(model_file_path(settings), int(settings.get("ai.num_threads", 1)), fast=False)
         lines.append(f"MobileNetV2 loaded in {time.time() - t0:.1f}s from {fx.weights_path}")
-        test_img = frame if frame is not None else np.full((480, 640, 3), 90, np.uint8)
+        test_img = frame if live else np.full((480, 640, 3), 90, np.uint8)
         crop, box = tray.crop(test_img)
         def median_ms(n: int = 7) -> float:
             samples = []
@@ -354,7 +368,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QLabel, QPushBu
                              QFileDialog, QPlainTextEdit, QStatusBar, QSplitter, QListWidget, QListWidgetItem,
                              QRadioButton, QButtonGroup)
 
-from rtk_camera import open_camera, CameraThread
+from rtk_camera import open_camera, find_camera, CameraThread
 from printer_driver import (ReceiptPrinter, Invoice, InvoiceLine, list_windows_printers, default_windows_printer,
                             fmt_money, fmt_weight)
 from ai_engine import (FeatureExtractor, ItemDatabase, RecognitionEngine, Recognition, Detection, Item, TrayRegion,
@@ -369,6 +383,8 @@ class Bus(QObject):
     embedding_ready = pyqtSignal(str, object)    # token, embeddings (n, 1280)
     model_ready = pyqtSignal(object, object)     # FeatureExtractor | None, error | None
     camera_ready = pyqtSignal(object)            # CameraOpenResult
+    camera_found = pyqtSignal(object)            # find_camera() report
+    scale_found = pyqtSignal(object)             # find_scale() report
     toast = pyqtSignal(str, bool)                # message, is_error
     print_done = pyqtSignal(bool, str)
     dialog_result = pyqtSignal(str, str, bool)   # kind, text, is_error  (settings dialog workers)
@@ -1803,6 +1819,7 @@ class MainWindow(QMainWindow):
         self.current_weight: Optional[WeightReading] = None
         self.camera_thread: Optional[CameraThread] = None
         self.camera_result = None
+        self.camera_ok = False
         self.engine: Optional[RecognitionEngine] = None
         self.extractor: Optional[FeatureExtractor] = None
         self.scale = None
@@ -1857,6 +1874,10 @@ class MainWindow(QMainWindow):
         self.cam_pill = QLabel(tr("no_camera"))
         self.cam_pill.setStyleSheet(PILL % PILL_NEUTRAL)
         head.addWidget(self.cam_pill)
+        self.cam_retry_btn = QPushButton(tr("camera_retry"))
+        self.cam_retry_btn.setVisible(False)
+        self.cam_retry_btn.clicked.connect(self.retry_camera)
+        head.addWidget(self.cam_retry_btn)
         ll.addLayout(head)
         self.video = VideoWidget()
         self.video.tray = self.tray
@@ -1959,6 +1980,13 @@ class MainWindow(QMainWindow):
         self.use_real_btn.setVisible(False)
         self.use_real_btn.clicked.connect(self._switch_to_real_scale)
         sl.addWidget(self.use_real_btn)
+        # when no port is configured at all there is nothing to switch to, so
+        # offer the search itself rather than sending the operator hunting
+        # through the settings tabs for it
+        self.find_scale_btn = QPushButton(tr("find_scale"))
+        self.find_scale_btn.setVisible(False)
+        self.find_scale_btn.clicked.connect(self.find_scale_now)
+        sl.addWidget(self.find_scale_btn)
         wl.addWidget(self.sim_box, 2, 0, 1, 3)
         # tray vs invoice: the line that makes a missed or extra item obvious
         self.recon_lbl = QLabel("")
@@ -2061,6 +2089,8 @@ class MainWindow(QMainWindow):
         self.bus.weight.connect(self.on_weight)
         self.bus.model_ready.connect(self.on_model_ready)
         self.bus.camera_ready.connect(self.on_camera_ready)
+        self.bus.camera_found.connect(self.on_camera_found)
+        self.bus.scale_found.connect(self.on_scale_found)
         self.bus.toast.connect(self.on_toast)
         self.bus.print_done.connect(self.on_print_done)
         self.bus.embedding_ready.connect(self.on_embedding)
@@ -2116,17 +2146,89 @@ class MainWindow(QMainWindow):
         threading.Thread(target=work, name="CameraOpener", daemon=True).start()
 
     def on_camera_ready(self, res):
+        """Adopt whatever camera we got - including none at all.
+
+        When there is no camera the placeholder picture used to be fed to the
+        segmenter, which quite reasonably decided something was moving over the
+        tray and refused to sell anything.  A missing camera now stops
+        recognition outright and says so, so the till still works by hand.
+        """
         self.camera_result = res
+        self.camera_ok = res.backend != "none"
         cam = self.settings.section("camera")
         self.camera_thread = CameraThread(res.source, float(cam.get("fps_limit", 15)), bool(cam.get("mirror")), int(cam.get("rotate", 0)))
         self.camera_thread.start()
-        self.cam_pill.setText(f"{tr('camera_backend')}: {res.backend.upper()}")
+        self.cam_pill.setText(f"{tr('camera_backend')}: {res.backend.upper()}" if self.camera_ok else tr("no_camera"))
+        self.cam_pill.setStyleSheet(PILL % (PILL_NEUTRAL if self.camera_ok else PILL_BAD))
         self.cam_pill.setToolTip(res.description + ("\n" + "\n".join(res.notes) if res.notes else ""))
         self.video.caption = res.description
+        self.cam_retry_btn.setVisible(not self.camera_ok)
+        if self.engine:
+            self.engine.paused = not self.camera_ok
+        if not self.camera_ok:
+            self.current_rec = None
+            self.video.rec = None
+        self._update_blocking()
         for n in res.notes:
             log.info("camera note: %s", n)
         if cam.get("backend") in ("auto", "rtk") and res.backend == "opencv" and any("32-bit" in n for n in res.notes):
             self.status.showMessage(tr("rtk_fallback_status"), 10000)
+
+    def retry_camera(self):
+        """Look for a camera again, trying every device index this time."""
+        self.cam_retry_btn.setEnabled(False)
+        self.cam_pill.setText(tr("find_camera_running"))
+        self.status.showMessage(tr("find_camera_running"))
+
+        def work():
+            res = find_camera()
+            if res.get("found"):
+                self.settings.set("camera.device_index", int(res["index"]))
+                self.settings.set("camera.backend", "opencv")
+                self.settings.save()
+            self.bus.camera_found.emit(res)
+
+        threading.Thread(target=work, name="CameraFinder", daemon=True).start()
+
+    def on_camera_found(self, res):
+        self.cam_retry_btn.setEnabled(True)
+        log.info("find_camera:\n%s", res.get("report", ""))
+        if res.get("found"):
+            self.status.showMessage(tr("find_camera_found", description=res["description"]), 8000)
+            self.start_camera()
+        else:
+            self.cam_pill.setText(tr("no_camera"))
+            msg_error(self, tr("find_camera_none") + "\n\n" + res.get("report", ""))
+
+    def find_scale_now(self):
+        """Search every port and USB device, then just use what answered."""
+        self.find_scale_btn.setEnabled(False)
+        self.scale_pill.setText(tr("find_scale_running"))
+        self.scale_pill.setStyleSheet(PILL % PILL_NEUTRAL)
+
+        def work():
+            try:
+                res = find_scale()
+            except Exception as exc:
+                log.exception("find_scale failed")
+                res = {"found": False, "report": str(exc)}
+            self.bus.scale_found.emit(res)
+
+        threading.Thread(target=work, name="ScaleFinder", daemon=True).start()
+
+    def on_scale_found(self, res):
+        self.find_scale_btn.setEnabled(True)
+        log.info("find_scale:\n%s", res.get("report", ""))
+        if res.get("found"):
+            for key, value in ((res.get("best") or {}).get("config") or {}).items():
+                self.settings.set(f"scale.{key}", value)
+            self.settings.set("scale.enabled", True)
+            self.settings.save()
+            self.start_scale()
+            self.status.showMessage(tr("find_scale_found", label=res["best"]["label"]), 8000)
+        else:
+            self.start_scale()
+            msg_error(self, tr("find_scale_none") + "\n\n" + str(res.get("report", ""))[-1500:])
 
     def _camera_frame(self):
         th = self.camera_thread
@@ -2158,6 +2260,7 @@ class MainWindow(QMainWindow):
                                         max_objects=int(ai.get("max_objects", 5)),
                                         min_area_frac=float(ai.get("min_area_frac", 0.008)),
                                         background_refresh=bool(ai.get("background_refresh", True)))
+        self.engine.paused = not self.camera_ok
         self.engine.start()
         self.video.hint = "" if self.engine.has_segmenter else tr("capture_empty_first")
         if self.db.backbone_mismatch:
@@ -2195,6 +2298,7 @@ class MainWindow(QMainWindow):
             self.sim_box.setVisible(True)
             self.use_real_btn.setVisible(self._scale_conflict)
             self.use_real_btn.setText(tr("use_real_scale", port=port))
+            self.find_scale_btn.setVisible(not port)
             note = f" ({port}: {tr('scale_sim_overrides_port')})" if self._scale_conflict else ""
             self.scale_pill.setText(f"{tr('scale_status')}: {tr('scale_simulated')}{note}")
             self.scale_pill.setStyleSheet(PILL % (PILL_WARN if self._scale_conflict else PILL_NEUTRAL))
@@ -2410,7 +2514,7 @@ class MainWindow(QMainWindow):
         """
         rec = self.current_rec
         mode = self.settings.get("pos.multi_item_mode", "interlock")
-        if mode == "off" or rec is None:
+        if mode == "off" or rec is None or not self.camera_ok:
             return None
         if rec.intrusion and self.settings.get("pos.refuse_on_intrusion", True):
             return tr("hand_detected")
@@ -2422,8 +2526,11 @@ class MainWindow(QMainWindow):
 
     def _update_blocking(self):
         reason = self.blocking_reason()
-        self.banner_lbl.setText(reason or "")
-        self.banner_lbl.setVisible(bool(reason))
+        # a missing camera is worth saying out loud, but it must not stop a sale:
+        # the operator can still pick the product from the list and weigh it
+        notice = reason or (tr("camera_dead") if not self.camera_ok else "")
+        self.banner_lbl.setText(notice)
+        self.banner_lbl.setVisible(bool(notice))
         self.add_btn.setEnabled(reason is None)
         self.video.banner = reason if reason and reason == tr("multi_item_block") else ""
 

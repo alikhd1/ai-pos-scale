@@ -268,6 +268,17 @@ STRINGS = {
     "source_simulate": ("Simulation (no hardware)", "شبیه\u200cسازی (بدون سخت\u200cافزار)"),
     "hid_device": ("USB scale device", "دستگاه ترازوی USB"),
     "hid_none": ("no USB scale found", "ترازوی USB پیدا نشد"),
+    "camera_dead": ("No camera - the till is in manual mode, pick products from the list",
+                    "دوربین کار نمی‌کند — صندوق در حالت دستی است؛ کالا را از فهرست انتخاب کنید"),
+    "camera_retry": ("Try the camera again", "تلاش دوباره برای دوربین"),
+    "find_camera": ("Find my camera", "پیدا کردن دوربین"),
+    "find_camera_running": ("Trying every camera on this machine, please wait...",
+                            "همه دوربین‌های این دستگاه آزمایش می‌شوند، لطفاً صبر کنید..."),
+    "find_camera_found": ("Found a working camera: {description}", "دوربین سالم پیدا شد: {description}"),
+    "find_camera_none": ("No camera produced a picture. Check the cable, and that no other program "
+                         "(Camera app, Skype, browser) is holding it open.",
+                         "هیچ دوربینی تصویر نداد. کابل را بررسی کنید و مطمئن شوید برنامه دیگری "
+                         "(برنامه Camera، اسکایپ، مرورگر) آن را اشغال نکرده باشد."),
     "find_scale": ("Find my scale", "پیدا کردن ترازو"),
     "find_scale_running": ("Searching every port and USB device, please wait...",
                            "در حال جستجوی همه پورت\u200cها و دستگاه\u200cهای USB، لطفاً صبر کنید..."),

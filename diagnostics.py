@@ -18,6 +18,7 @@ particular produce, is the whole problem.  This module packages that evidence:
     recognition.txt      every candidate and score for every object
     items.txt            the catalogue: samples, captures, thresholds, look-alikes
     config.json          the settings (no secrets are stored in it)
+    camera.txt           what the camera layer tried and what Windows can see
     selftest_report.txt  the last self-test, if there is one
     aipos.log            the tail of the log
 
@@ -176,6 +177,18 @@ def collect(path: str, frame: Optional[np.ndarray], tray, db, engine, settings,
             z.writestr("config.json", json.dumps(settings.as_dict(), ensure_ascii=False, indent=2))
         except Exception:
             pass
+        # a bundle sent because "the camera does not work" is useless without
+        # what the camera layer actually tried and what Windows can see
+        try:
+            from rtk_camera import diagnose, windows_imaging_devices
+            cam_lines = [diagnose(settings.get("camera.sdk_dll", "RTKCamSDK.dll")), "",
+                         "camera settings: " + json.dumps(settings.section("camera"), ensure_ascii=False),
+                         "", "devices Windows reports:"]
+            cam_lines += [f"  {d}" for d in windows_imaging_devices()] or ["  none"]
+            z.writestr("camera.txt", "\n".join(cam_lines))
+        except Exception as exc:
+            z.writestr("camera.txt", f"could not collect camera information: {exc}")
+
         for name in ("selftest_report.txt", "crash_history.txt"):
             src = os.path.join(os.path.dirname(os.path.abspath(path)), name)
             if os.path.isfile(src):
