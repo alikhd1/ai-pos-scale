@@ -15,6 +15,7 @@ Virtual camera  :  python app.py --video some_clip.avi
 from __future__ import annotations
 
 import argparse
+import base64
 import datetime as dt
 import json
 import logging
@@ -35,9 +36,15 @@ from scale_driver import (ScaleReader, list_serial_ports, diagnose_scale, find_s
                           resolve_source, BAUDRATES, WeightReading, printable, hexdump,
                           SOURCE_AUTO, SOURCE_HID, SOURCE_SERIAL, SOURCE_SIMULATE)
 from hid_scale import list_hid_scales
+from remote_support import RemoteSupport, encode_frame, log_tail, ACTIONS as SUPPORT_ACTIONS
 import diagnostics
 
 log = logging.getLogger("app")
+
+APP_VERSION = "1.4"
+
+#: distinguishes "the setting is None" from "there is no such setting"
+_MISSING = object()
 
 
 # --------------------------------------------------------------------------- #
@@ -358,7 +365,7 @@ def run_selftest(settings: SettingsManager, video_file: str = "") -> int:
 # GUI
 # --------------------------------------------------------------------------- #
 import cv2
-from PyQt6.QtCore import Qt, QTimer, QObject, pyqtSignal, QSize, QRectF, QPointF
+from PyQt6.QtCore import Qt, QTimer, QObject, pyqtSignal, QSize, QRectF, QPointF, QBuffer, QThread
 from PyQt6.QtGui import (QImage, QPixmap, QPainter, QPen, QColor, QFont, QBrush, QIcon, QKeySequence, QShortcut,
                          QFontDatabase, QGuiApplication, QPainterPath, QPolygonF)
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QLabel, QPushButton, QVBoxLayout, QHBoxLayout,
@@ -1259,6 +1266,7 @@ class SettingsDialog(QDialog):
         tabs.addTab(self._camera_tab(), tr("tab_camera"))
         tabs.addTab(self._scale_tab(), tr("tab_scale"))
         tabs.addTab(self._printer_tab(), tr("tab_printer"))
+        tabs.addTab(self._support_tab(), tr("tab_support"))
         lay = QVBoxLayout(self)
         lay.addWidget(tabs)
         note = QLabel(tr("restart_note"))
@@ -1271,6 +1279,10 @@ class SettingsDialog(QDialog):
         self.bus.dialog_result.connect(self.on_dialog_result)
 
     def on_dialog_result(self, kind: str, text: str, is_error: bool):
+        if kind == "support":
+            self.sup_test_btn.setEnabled(True)
+            (msg_error if is_error else msg_info)(self, text)
+            return
         if kind == "scale_line":
             self._append_scale(text)
         elif kind == "scale_done":
@@ -1774,9 +1786,75 @@ class SettingsDialog(QDialog):
 
         threading.Thread(target=work, daemon=True).start()
 
+    def _support_tab(self):
+        """Remote support, spelled out: the owner sees exactly what leaves the till."""
+        w = QWidget()
+        f = QFormLayout(w)
+        sup = self.settings.section("support")
+        self.sup_enabled = QCheckBox(tr("support_enabled"))
+        self.sup_enabled.setChecked(bool(sup.get("enabled")))
+        self.sup_url = QLineEdit(sup.get("url", ""))
+        self.sup_url.setPlaceholderText("https://example.com/pos")
+        self.sup_token = QLineEdit(sup.get("token", ""))
+        self.sup_token.setEchoMode(QLineEdit.EchoMode.Password)
+        self.sup_interval = QSpinBox()
+        self.sup_interval.setRange(1, 1440)
+        self.sup_interval.setValue(int(sup.get("interval_min", 10)))
+        self.sup_frames = QCheckBox(tr("support_frames"))
+        self.sup_frames.setChecked(bool(sup.get("send_frames", True)))
+        self.sup_log = QCheckBox(tr("support_log"))
+        self.sup_log.setChecked(bool(sup.get("send_log", True)))
+        self.sup_actions = QCheckBox(tr("support_actions"))
+        self.sup_actions.setChecked(bool(sup.get("allow_actions", True)))
+        self.sup_test_btn = QPushButton(tr("support_test"))
+        self.sup_test_btn.clicked.connect(self._test_support)
+        note = QLabel(tr("support_note"))
+        note.setWordWrap(True)
+        note.setStyleSheet("color:#9aa3b5")
+        actions = QLabel(", ".join(sorted(SUPPORT_ACTIONS)))
+        actions.setWordWrap(True)
+        actions.setStyleSheet("color:#9aa3b5")
+        f.addRow(self.sup_enabled)
+        f.addRow(tr("support_url"), self.sup_url)
+        f.addRow(tr("support_token"), self.sup_token)
+        f.addRow(tr("support_interval"), self.sup_interval)
+        f.addRow(self.sup_frames)
+        f.addRow(self.sup_log)
+        f.addRow(self.sup_actions)
+        f.addRow(actions)
+        f.addRow(self.sup_test_btn)
+        f.addRow(note)
+        return w
+
+    def _test_support(self):
+        from remote_support import RemoteSupport as _RS
+        self.sup_test_btn.setEnabled(False)
+        # test what is typed in the boxes, not what was last saved
+        typed = {"support.enabled": True, "support.url": self.sup_url.text().strip(),
+                 "support.token": self.sup_token.text().strip()}
+        probe = type("TypedSettings", (), {"get": lambda _s, key, default=None: typed.get(key, default)})()
+        channel = _RS(probe, lambda: {"test": True, "at": dt.datetime.now().isoformat(timespec="seconds")},
+                      lambda name, args: {})
+
+        def work():
+            try:
+                channel.test()
+                self.bus.dialog_result.emit("support", tr("support_ok"), False)
+            except Exception as exc:
+                self.bus.dialog_result.emit("support", str(exc), True)
+
+        threading.Thread(target=work, daemon=True).start()
+
     # -- save
     def save(self):
         s = self.settings
+        s.update_section("support", {"enabled": self.sup_enabled.isChecked(),
+                                     "url": self.sup_url.text().strip(),
+                                     "token": self.sup_token.text().strip(),
+                                     "interval_min": int(self.sup_interval.value()),
+                                     "send_frames": self.sup_frames.isChecked(),
+                                     "send_log": self.sup_log.isChecked(),
+                                     "allow_actions": self.sup_actions.isChecked()})
         s.update_section("general", {"language": self.lang.currentData(), "store_name": self.store.text().strip(),
                                      "currency": self.currency.text().strip(), "currency_decimals": self.cur_dec.value(),
                                      "auto_add": self.auto_add.isChecked()})
@@ -1820,6 +1898,7 @@ class MainWindow(QMainWindow):
         self.camera_thread: Optional[CameraThread] = None
         self.camera_result = None
         self.camera_ok = False
+        self.support = None
         self.engine: Optional[RecognitionEngine] = None
         self.extractor: Optional[FeatureExtractor] = None
         self.scale = None
@@ -2131,6 +2210,176 @@ class MainWindow(QMainWindow):
         self.status_printer.setText(f"{tr('tab_printer')}: {self.settings.get('printer.interface')}")
         threading.Thread(target=self._load_model, name="ModelLoader", daemon=True).start()
         self.status.showMessage(tr("loading_model"))
+        self.start_support()
+
+    # -------------------------------------------------------- remote support
+    def start_support(self):
+        """Start the outbound support channel, if the owner configured one."""
+        self.stop_support()
+        self.support = RemoteSupport(self.settings, self.support_snapshot, self.support_action)
+        if self.support.start():
+            self.status.showMessage(tr("support_on", url=self.support.url), 8000)
+
+    def stop_support(self):
+        support = getattr(self, "support", None)
+        if support:
+            support.stop()
+        self.support = None
+
+    def support_snapshot(self) -> dict:
+        """Everything a remote helper needs to see, in one JSON-safe dict.
+
+        Called from the support thread, so it only reads: the one thing it asks
+        the UI thread for is the window picture, and only on request.
+        """
+        sc = self.settings.section("scale")
+        cam_res = self.camera_result
+        reading = self.current_weight
+        rec = self.current_rec
+        snap = {
+            "at": dt.datetime.now().isoformat(timespec="seconds"),
+            "camera": {
+                "ok": self.camera_ok,
+                "backend": getattr(cam_res, "backend", None),
+                "description": getattr(cam_res, "description", ""),
+                "notes": list(getattr(cam_res, "notes", []) or []),
+                "attempts": list(getattr(getattr(cam_res, "source", None), "attempts", []) or []),
+                "settings": self.settings.section("camera"),
+            },
+            "scale": {
+                "source": self.scale_source,
+                "port": sc.get("port", ""),
+                "conflict": bool(getattr(self, "_scale_conflict", False)),
+                "health": self.scale.health() if self.scale else None,
+                "weight_kg": None if reading is None else round(reading.weight_kg, 4),
+                "stable": None if reading is None else bool(reading.stable),
+                "pill": self.scale_pill.text(),
+            },
+            "screen": {
+                "banner": self.banner_lbl.text(),
+                "detected": self.detected_lbl.text(),
+                "blocking_reason": self.blocking_reason(),
+                "can_add": self.add_btn.isEnabled(),
+            },
+            "invoice": {
+                "lines": len(self.lines),
+                "invoiced_kg": round(self.invoiced_weight(), 4),
+                "tray_kg": None if self.tray_weight() is None else round(self.tray_weight(), 4),
+                "difference_kg": None if self.weight_difference() is None else round(self.weight_difference(), 4),
+            },
+            "catalogue": {"items": len(self.db), "has_empty_tray": bool(self.db.has_background_image)},
+            "engine": {
+                "loaded": self.engine is not None,
+                "paused": bool(getattr(self.engine, "paused", False)) if self.engine else None,
+                "optimized": bool(getattr(self.extractor, "optimized", False)) if self.extractor else None,
+                "segmenter": bool(getattr(self.engine, "has_segmenter", False)) if self.engine else False,
+            },
+        }
+        if rec is not None:
+            snap["recognition"] = {
+                "mode": rec.mode, "empty": rec.empty, "intrusion": rec.intrusion,
+                "unreliable": rec.unreliable, "objects": len(rec.detections),
+                "seg_ms": round(rec.seg_ms, 1), "infer_ms": round(rec.infer_ms, 1),
+                "items": [{"name": d.name, "score": round(d.score, 3), "accepted": d.accepted,
+                           "suggested": d.suggested_name} for d in rec.detections[:5]],
+            }
+        if self.settings.get("support.send_frames", True):
+            _fid, frame = self._camera_frame()
+            snap["frame_jpeg_b64"] = encode_frame(frame)
+        if self.settings.get("support.send_log", True):
+            snap["log_tail"] = log_tail(data_path("aipos.log"), 200)
+        return snap
+
+    def support_action(self, name: str, args: dict) -> dict:
+        """Run one of the actions in remote_support.ACTIONS. Nothing else.
+
+        Slow work (a self-test loads a second copy of the model, a camera sweep
+        takes seconds per device) stays on the support thread; only the few
+        steps that touch Qt are handed to the UI thread.
+        """
+        if name == "ping":
+            return {"pong": True, "version": APP_VERSION}
+        if name == "snapshot":
+            return {"snapshot": self.support_snapshot()}
+        if name == "logs":
+            return {"log": log_tail(data_path("aipos.log"), int(args.get("lines", 1000)))}
+        if name == "selftest":
+            run_selftest(self.settings)
+            return {"report": log_tail(data_path("selftest_report.txt"), 400)}
+        if name == "find_camera":
+            found = find_camera()
+            if found["found"] and args.get("apply", True):
+                self._on_ui(lambda: (self.settings.set("camera.device_index", int(found["index"])),
+                                     self.settings.set("camera.backend", "opencv"),
+                                     self.settings.save(), self.start_camera()))
+            return found
+        if name == "find_scale":
+            found = find_scale()
+            if found.get("found") and args.get("apply", True):
+                self._on_ui(lambda: self.on_scale_found(found))
+            return {"found": found.get("found"), "report": found.get("report", "")[-4000:],
+                    "best": (found.get("best") or {}).get("label")}
+        if name == "restart_camera":
+            self._on_ui(self.start_camera)
+            return {"restarted": True}
+        if name == "restart_scale":
+            self._on_ui(self.start_scale)
+            return {"restarted": True, "source": self.scale_source}
+        if name == "diagnostics":
+            path = diagnostics.default_path(app_dir())
+            _fid, frame = self._camera_frame()
+            diagnostics.collect(path, frame, self.tray, self.db, self.engine, self.settings,
+                                self.current_rec, note="collected remotely")
+            with open(path, "rb") as fh:
+                blob = fh.read()
+            return {"filename": os.path.basename(path), "bytes": len(blob),
+                    "zip_b64": base64.b64encode(blob).decode("ascii")}
+        if name == "get_setting":
+            return {"key": args.get("key"), "value": self.settings.get(str(args.get("key", "")))}
+        if name == "set_setting":
+            key, value = str(args.get("key", "")), args.get("value")
+            # only keys that already exist: no inventing new ones remotely
+            if self.settings.get(key, _MISSING) is _MISSING:
+                raise ValueError(f"no such setting: {key!r}")
+            self._on_ui(lambda: (self.settings.set(key, value), self.settings.save()))
+            return {"key": key, "value": self.settings.get(key),
+                    "note": "a restart may be needed for this to take effect"}
+        if name == "screenshot":
+            return {"png_b64": self._on_ui(self._grab_window_png)}
+        raise ValueError(f"unsupported action: {name!r}")
+
+    def _grab_window_png(self) -> str:
+        buf = QBuffer()
+        buf.open(QBuffer.OpenModeFlag.WriteOnly)
+        self.grab().save(buf, "PNG")
+        return base64.b64encode(bytes(buf.data())).decode("ascii")
+
+    def _on_ui(self, fn, timeout: float = 90.0):
+        """Run ``fn`` on the UI thread and wait for its result.
+
+        Called from the UI thread it runs straight away: posting to the event
+        loop and then blocking that same loop waiting for the answer is a
+        deadlock, and it is an easy one to walk into from a test or a menu.
+        """
+        if QThread.currentThread() is self.thread():
+            return fn()
+        box: dict = {}
+        done = threading.Event()
+
+        def wrapper():
+            try:
+                box["value"] = fn()
+            except Exception as exc:
+                box["error"] = exc
+            finally:
+                done.set()
+
+        QTimer.singleShot(0, wrapper)
+        if not done.wait(timeout):
+            raise TimeoutError("the application did not answer in time")
+        if "error" in box:
+            raise box["error"]
+        return box.get("value")
 
     def start_camera(self):
         if self.camera_thread:
@@ -2996,6 +3245,7 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------ close
     def closeEvent(self, event):
         try:
+            self.stop_support()
             if self.engine:
                 self.engine.stop()
             if self.camera_thread:

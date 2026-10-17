@@ -11,6 +11,9 @@ items_db.pkl
 items_db.pkl.corrupt
 invoices/
 aipos.log
+session.lock
+crash_history.txt
+aipos_diagnostics_*.zip
 selftest_report.txt
 selftest_receipt.*
 test_receipt.bin

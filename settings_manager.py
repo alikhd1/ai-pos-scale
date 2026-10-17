@@ -116,6 +116,19 @@ DEFAULTS: Dict[str, Dict[str, Any]] = {
         "refuse_on_unreliable": True,     # failed photometric alignment blocks Add
         "reinforce_on_manual_pick": True, # a manual item pick teaches the model today's lighting
     },
+    "support": {
+        # Outbound-only remote support, for a till nobody can walk up to.
+        # Off until the owner fills in both the URL and the token; see
+        # remote_support.py for what it does and, more importantly, what it
+        # deliberately cannot do.
+        "enabled": False,
+        "url": "",                        # https://host/path of the support service
+        "token": "",                      # shared secret, sent as a bearer token
+        "interval_min": 10,               # how often to post a snapshot
+        "send_frames": True,              # include a small JPEG of the camera view
+        "send_log": True,
+        "allow_actions": True,            # let the service ask for the actions in ACTIONS
+    },
     "printer": {
         "enabled": True,
         "interface": "windows",           # "windows" (spooler RAW) | "serial" | "file" | "none"

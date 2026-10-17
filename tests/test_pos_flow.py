@@ -18,7 +18,7 @@ Needs no hardware: the camera and the scale are both scripted.
 
 Run:  python tests/test_pos_flow.py
 """
-import os, sys, time, tempfile, shutil, traceback, zipfile
+import os, sys, json, time, tempfile, shutil, traceback, zipfile
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
 os.environ["QT_QPA_FONTDIR"] = r"C:\Windows\Fonts"
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -44,6 +44,15 @@ def check(name, cond, detail=""):
         results["ok"] = False
         FAILED.append((name, detail))
     print(f"  {'PASS' if cond else 'FAIL'}  {name}" + (f"   [{detail}]" if detail else ""))
+
+def _refuses(win, action, args):
+    """True when the support channel turns an action down instead of doing it."""
+    try:
+        win.support_action(action, args)
+        return False
+    except Exception:
+        return True
+
 
 messages = []
 A.msg_info = lambda p, t: messages.append(("info", t))
@@ -227,6 +236,25 @@ try:
 
     print("\n[7] object outlines are drawn")
     check("mask outlines are on by default", win.video.show_masks)
+
+    print("\n[8] the remote support snapshot describes this till")
+    # a till nobody can walk up to is debugged from this dict alone, so it has
+    # to carry the state a person would otherwise have to ask about
+    snap = win.support_snapshot()
+    check("it is JSON-safe", bool(json.dumps(snap, default=str)))
+    for key in ("camera", "scale", "screen", "invoice", "catalogue", "engine"):
+        check(f"snapshot has {key}", key in snap)
+    check("it reports the camera state", snap["camera"]["ok"] == win.camera_ok, str(snap["camera"]["ok"]))
+    check("it reports the catalogue", snap["catalogue"]["items"] == 2, str(snap["catalogue"]))
+    check("it reports the invoice", snap["invoice"]["lines"] == len(win.lines), str(snap["invoice"]))
+    check("it carries a picture", isinstance(snap.get("frame_jpeg_b64"), str) and len(snap["frame_jpeg_b64"]) > 100)
+    check("it carries the log tail", "log_tail" in snap)
+    check("ping answers", win.support_action("ping", {})["pong"] is True)
+    check("an unknown action is refused", _refuses(win, "exec", {}))
+    check("an unknown setting is refused", _refuses(win, "set_setting", {"key": "pos.not_a_real_key", "value": 1}))
+    win.support_action("set_setting", {"key": "ai.top_k", "value": 4})
+    check("a known setting can be changed", int(win.settings.get("ai.top_k")) == 4)
+    check("the support channel is off by default", win.support is None or not win.support.configured())
 except Exception:
     traceback.print_exc(); results["ok"] = False
 finally:

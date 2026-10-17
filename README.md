@@ -145,8 +145,49 @@ transmit when the PC side is ready. An unstable (moving) weight is always displa
 text prints correctly on any ESC/POS printer. `text` mode sends plain ESC/POS text for
 Latin receipts. Transports: any Windows printer (RAW spool) or a serial COM printer.
 
+## Remote support, for a till you cannot walk up to
+
+A POS terminal lives in a shop, behind a router nobody controls, and the person who has
+to fix it is usually somewhere else. Switched on, the app posts a snapshot of itself to a
+service you run, every ten minutes by default: whether the camera is working and which
+picture formats it tried, what the scale reads, the exact banner on the screen and why
+the till is refusing to sell, the invoice, the catalogue size, the tail of the log and a
+small picture of the camera view.
+
+Turn it on in **Settings > Remote support**. Nothing is sent until both the address and
+the token are filled in, and the page lists exactly what leaves the machine, each part
+switchable on its own.
+
+The service can also queue a short list of support actions, which the till picks up at
+its next check-in: `ping, snapshot, selftest, find_camera, find_scale, restart_camera,
+restart_scale, diagnostics, logs, get_setting, set_setting, screenshot`. That list is
+closed. **This is not a remote shell and must not become one** - there is no "run this
+command", no download-and-execute, and `set_setting` only accepts a key that already
+exists. A till handles money; a general-purpose backdoor on one is a liability for
+whoever installs it, and this fixed list buys nearly all of the usefulness for a small
+fraction of the risk. Connections are outbound HTTPS only (plain HTTP is refused unless
+it is the loopback), nothing listens on a port, and `allow_actions` turns even the listed
+ones off, leaving a report-only channel.
+
+The other end is in [`support_server/`](support_server/): one stdlib-only Python file, no
+pip, no virtualenv. `setup-ubuntu.sh` installs it under systemd on the loopback and adds
+one `location` block to an nginx site you already have a certificate for, so no new DNS
+record and no new certificate are needed:
+
+```bash
+sudo ./setup-ubuntu.sh --site /etc/nginx/sites-available/your-site.conf --path /pos
+```
+
+It generates two separate tokens - the one the tills carry, and the admin one that the
+dashboard and the action queue need - and prints them once. The dashboard is a single
+page showing every till, its camera picture, its state, and a button per action.
+
 ## Troubleshooting
 
+* **A till stopped reporting to the support service.** The dashboard greys out tills that
+  have not checked in. Nothing can be done from this end: the channel is outbound only, so
+  if the shop's internet is down or the app is closed, somebody has to be there. The till
+  keeps the results of any action it ran and sends them when it gets back.
 * **The screen says "No camera".** The till stays usable: it drops into manual mode, the
   banner says so, and you can still pick a product from the list and weigh it. Press
   *Try the camera again* next to the pill - it tries every device index on the machine,

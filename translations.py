@@ -268,6 +268,27 @@ STRINGS = {
     "source_simulate": ("Simulation (no hardware)", "شبیه\u200cسازی (بدون سخت\u200cافزار)"),
     "hid_device": ("USB scale device", "دستگاه ترازوی USB"),
     "hid_none": ("no USB scale found", "ترازوی USB پیدا نشد"),
+    "tab_support": ("Remote support", "پشتیبانی از راه دور"),
+    "support_enabled": ("Send this till's status to a support service",
+                        "ارسال وضعیت این صندوق به سرویس پشتیبانی"),
+    "support_url": ("Service address (https)", "آدرس سرویس (https)"),
+    "support_token": ("Token", "کلید دسترسی"),
+    "support_interval": ("Send every (minutes)", "ارسال هر (دقیقه)"),
+    "support_frames": ("Include a small picture of the camera view",
+                       "ارسال یک تصویر کوچک از نمای دوربین"),
+    "support_log": ("Include the tail of the log", "ارسال انتهای فایل گزارش"),
+    "support_actions": ("Let the service run support actions (self-test, find camera, change a setting)",
+                        "اجازه اجرای کارهای پشتیبانی (خودآزمایی، پیدا کردن دوربین، تغییر یک تنظیم)"),
+    "support_test": ("Send a test now", "ارسال آزمایشی"),
+    "support_ok": ("Sent. The service answered.", "ارسال شد. سرویس پاسخ داد."),
+    "support_on": ("Remote support is on, sending to {url}",
+                   "پشتیبانی از راه دور روشن است، ارسال به {url}"),
+    "support_note": ("Nothing is sent until you fill in both the address and the token. The till only "
+                     "sends, never listens, and the service can only ask for the fixed list of support "
+                     "actions - it cannot run commands on this computer.",
+                     "تا وقتی آدرس و کلید را وارد نکنید هیچ چیزی ارسال نمی‌شود. صندوق فقط ارسال می‌کند و "
+                     "هرگز پورتی باز نمی‌کند، و سرویس فقط می‌تواند همان فهرست ثابت کارهای پشتیبانی را "
+                     "درخواست کند — امکان اجرای دستور روی این کامپیوتر وجود ندارد."),
     "camera_dead": ("No camera - the till is in manual mode, pick products from the list",
                     "دوربین کار نمی‌کند — صندوق در حالت دستی است؛ کالا را از فهرست انتخاب کنید"),
     "camera_retry": ("Try the camera again", "تلاش دوباره برای دوربین"),
