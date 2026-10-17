@@ -281,8 +281,24 @@ def render_till(entry: dict) -> str:
 class Handler(BaseHTTPRequestHandler):
     server_version = "pos-support/1"
 
+    def client_ip(self) -> str:
+        """The real caller, not nginx.
+
+        Everything arrives from the loopback because nginx proxies it, so the
+        service's own log said 127.0.0.1 for every till on earth and was
+        useless for the one question it gets asked: has this shop's machine
+        ever reached us at all.  X-Forwarded-For is only trustworthy because
+        the only thing that can talk to us is our own nginx on 127.0.0.1.
+        """
+        peer = self.client_address[0] if self.client_address else "?"
+        if peer not in ("127.0.0.1", "::1"):
+            return peer                      # not proxied: believe the socket
+        forwarded = (self.headers.get("X-Forwarded-For") or "").split(",")[0].strip()
+        return forwarded or peer
+
     def log_message(self, fmt, *args):
-        log.info("%s %s", self.address_string(), fmt % args)
+        agent = (self.headers.get("User-Agent") or "-")[:40] if self.headers else "-"
+        log.info("%s %s [%s]", self.client_ip(), fmt % args, agent)
 
     # ---- helpers
     def _send(self, code: int, body: bytes, content_type: str, extra: dict = None):
@@ -382,6 +398,7 @@ class Handler(BaseHTTPRequestHandler):
                     return self._json(401, {"error": "bad device token"})
                 body = self._body()
                 till = str((body.get("machine") or {}).get("host") or "unknown")
+                body["seen_from"] = self.client_ip()
                 store_results(till, body.get("results") or [])
                 store_snapshot(till, body)
                 actions = [] if body.get("test") else take_queue(till)
