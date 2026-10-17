@@ -42,6 +42,10 @@ python app.py --selftest      (head-less diagnostics -> selftest_report.txt)
 python tests/run_all.py       (regression tests, no hardware needed)
 ```
 
+Updating a till that runs from source is `git pull` then `python -m pip install -r
+requirements.txt` - the second step matters, because a missing `certifi` silently puts
+the Windows certificate store back in the TLS path and the self-test will say so.
+
 ## Build the executable
 
 ```bat
@@ -172,6 +176,14 @@ already cached in the Windows store and, unlike a browser, never triggers Window
 -this-root-on-demand update, so a till that has never pulled down the relevant root fails
 to verify a perfectly good certificate while the same URL opens fine in Edge on that same
 machine. Point `support.ca_file` at your own bundle if you terminate TLS yourself.
+
+Check it on the till itself with `python app.py --selftest` (or `AIPosScale.exe
+--selftest`): the *remote support* section names the address in use, says whether the
+key came from the build or from `config.json`, prints which certificate bundle is
+trusted, and reports whether the service actually answered. It only pings `/healthz`, so
+running a self-test does not register the machine as a till. If `certifi` is missing it
+says so and fails the self-test, because that silently puts the Windows certificate store
+back in the path - which is what broke the channel in the first place.
 
 The service can also queue a short list of support actions, which the till picks up at
 its next check-in: `ping, snapshot, selftest, find_camera, find_scale, restart_camera,

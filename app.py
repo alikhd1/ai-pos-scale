@@ -183,6 +183,8 @@ def scale_is_simulated(settings: SettingsManager) -> bool:
 # Head-less self-test (also used by build.bat and on the target machine)
 # --------------------------------------------------------------------------- #
 def run_selftest(settings: SettingsManager, video_file: str = "") -> int:
+    import urllib.request
+    import remote_support
     from rtk_camera import diagnose, open_camera, find_camera
     from scale_driver import parse_weight, list_serial_ports, diagnose_scale
     from printer_driver import ReceiptPrinter, Invoice, InvoiceLine, list_windows_printers
@@ -349,6 +351,35 @@ def run_selftest(settings: SettingsManager, video_file: str = "") -> int:
     except Exception as exc:
         ok = False
         lines.append(f"printer FAILED: {exc}")
+
+    section("remote support")
+    sup = settings.section("support")
+    url = (sup.get("url") or "").strip() or support_config.DEFAULT_URL
+    token = (sup.get("token") or "").strip() or support_config.DEFAULT_TOKEN
+    lines.append(f"enabled={bool(sup.get('enabled'))}  url={url or '(none)'}  "
+                 f"key={'built into this build' if not (sup.get('token') or '').strip() else 'from config.json'}"
+                 f"  every {sup.get('interval_min', 10)} min")
+    bundle = remote_support.ca_bundle()
+    lines.append(f"TLS trust: {bundle or 'the machine certificate store (certifi is NOT bundled)'}")
+    if bundle is None:
+        # the exact failure this was built to prevent, so it must be loud
+        lines.append("  WARNING: without the shipped bundle this till depends on the Windows "
+                     "certificate store, which is what made the support channel fail before.")
+        ok = False
+    if not url or not token:
+        lines.append("no support service configured, nothing to check")
+    else:
+        # only a reachability check: posting a snapshot here would register the
+        # build machine as a till every time anybody runs the self-test
+        try:
+            context = remote_support.ssl_context(str(sup.get("ca_file") or ""))
+            t0 = time.time()
+            with urllib.request.urlopen(url.rstrip("/") + "/healthz", timeout=20, context=context) as resp:
+                body = resp.read(4096).decode("utf-8", errors="replace").strip()
+            lines.append(f"reached {url} in {time.time() - t0:.1f}s: HTTP {resp.status} {body}")
+        except Exception as exc:
+            lines.append(f"CANNOT REACH {url}: {remote_support.explain_tls_error(exc, url)}")
+            ok = False
 
     lines.append("")
     lines.append("RESULT: " + ("OK" if ok else "PROBLEMS FOUND"))
