@@ -37,6 +37,7 @@ from scale_driver import (ScaleReader, list_serial_ports, diagnose_scale, find_s
                           SOURCE_AUTO, SOURCE_HID, SOURCE_SERIAL, SOURCE_SIMULATE)
 from hid_scale import list_hid_scales
 from remote_support import RemoteSupport, encode_frame, log_tail, ACTIONS as SUPPORT_ACTIONS
+import support_config
 import diagnostics
 
 log = logging.getLogger("app")
@@ -1793,10 +1794,13 @@ class SettingsDialog(QDialog):
         sup = self.settings.section("support")
         self.sup_enabled = QCheckBox(tr("support_enabled"))
         self.sup_enabled.setChecked(bool(sup.get("enabled")))
+        # left blank, these fall back to what the build was made with, so the
+        # placeholder has to show the value that will actually be used
         self.sup_url = QLineEdit(sup.get("url", ""))
-        self.sup_url.setPlaceholderText("https://example.com/pos")
+        self.sup_url.setPlaceholderText(support_config.DEFAULT_URL or "https://example.com/pos")
         self.sup_token = QLineEdit(sup.get("token", ""))
         self.sup_token.setEchoMode(QLineEdit.EchoMode.Password)
+        self.sup_token.setPlaceholderText(tr("support_builtin_token") if support_config.have_defaults() else "")
         self.sup_interval = QSpinBox()
         self.sup_interval.setRange(1, 1440)
         self.sup_interval.setValue(int(sup.get("interval_min", 10)))
@@ -1808,7 +1812,8 @@ class SettingsDialog(QDialog):
         self.sup_actions.setChecked(bool(sup.get("allow_actions", True)))
         self.sup_test_btn = QPushButton(tr("support_test"))
         self.sup_test_btn.clicked.connect(self._test_support)
-        note = QLabel(tr("support_note"))
+        note = QLabel(tr("support_builtin", url=support_config.DEFAULT_URL) + "\n\n" + tr("support_note")
+                      if support_config.have_defaults() else tr("support_note"))
         note.setWordWrap(True)
         note.setStyleSheet("color:#9aa3b5")
         actions = QLabel(", ".join(sorted(SUPPORT_ACTIONS)))
@@ -1831,7 +1836,8 @@ class SettingsDialog(QDialog):
         self.sup_test_btn.setEnabled(False)
         # test what is typed in the boxes, not what was last saved
         typed = {"support.enabled": True, "support.url": self.sup_url.text().strip(),
-                 "support.token": self.sup_token.text().strip()}
+                 "support.token": self.sup_token.text().strip(),
+                 "support.ca_file": self.settings.get("support.ca_file", "")}
         probe = type("TypedSettings", (), {"get": lambda _s, key, default=None: typed.get(key, default)})()
         channel = _RS(probe, lambda: {"test": True, "at": dt.datetime.now().isoformat(timespec="seconds")},
                       lambda name, args: {})

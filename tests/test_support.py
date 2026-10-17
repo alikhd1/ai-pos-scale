@@ -17,14 +17,21 @@ what it REFUSES to do:
 
 Run:  python tests/test_support.py
 """
-import os, sys, json, time, threading, traceback
+import os, sys, ssl, json, time, threading, traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 os.chdir(ROOT)
 
-from remote_support import RemoteSupport, ACTIONS, encode_frame, log_tail, SupportError
+import support_config
+from remote_support import (RemoteSupport, ACTIONS, encode_frame, log_tail, SupportError,
+                            ca_bundle, ssl_context, explain_tls_error)
+
+# most of these checks are about a build that has NOT been pointed anywhere;
+# the shipped build has an address baked in, so blank it for the duration
+support_config.DEFAULT_URL = ""
+support_config.DEFAULT_TOKEN = ""
 
 ok = {"all": True}
 FAILED = []
@@ -190,7 +197,47 @@ try:
     check("the bad one is reported as failed", pending["a5"]["ok"] is False)
     check("with the reason", "always fails" in pending["a5"]["error"], pending["a5"].get("error", ""))
 
-    print("\n[10] helpers")
+    print("\n[10] a build with an address baked in needs no configuration")
+    support_config.DEFAULT_URL, support_config.DEFAULT_TOKEN = URL, "secret-token"
+    try:
+        RECEIVED.clear()
+        channel = RemoteSupport(Settings(url="", token=""), snapshot, run_action)
+        check("it uses the built-in address", channel.url == URL, channel.url)
+        check("and the built-in key", channel.token == "secret-token")
+        check("it knows it is on defaults", channel.using_defaults is True)
+        check("it starts with an empty config", channel.start() is True)
+        deadline = time.time() + 10
+        while not RECEIVED and time.time() < deadline:
+            time.sleep(0.05)
+        check("and reports in", len(RECEIVED) >= 1, str(len(RECEIVED)))
+        channel.stop()
+        # a till pointed somewhere by hand must still win over the built-in one
+        other = RemoteSupport(Settings(url="https://elsewhere.example/pos", token="mine"), snapshot, run_action)
+        check("config beats the built-in address", other.url == "https://elsewhere.example/pos", other.url)
+        check("config beats the built-in key", other.token == "mine")
+        check("and it says so", other.using_defaults is False)
+        off = RemoteSupport(Settings(enabled=False), snapshot, run_action)
+        check("a single till can still be switched off", off.start() is False)
+    finally:
+        support_config.DEFAULT_URL, support_config.DEFAULT_TOKEN = "", ""
+
+    print("\n[11] TLS is verified against a bundle we ship, not the machine's store")
+    bundle = ca_bundle()
+    check("a CA bundle is available", bundle is not None and os.path.isfile(bundle), str(bundle))
+    ctx = ssl_context()
+    check("the context verifies", ctx.verify_mode == ssl.CERT_REQUIRED)
+    check("and checks the hostname", ctx.check_hostname is True)
+    check("the same context is reused", ssl_context() is ctx)
+    check("an explicit bundle is honoured", ssl_context(bundle) is not None)
+    explained = explain_tls_error(
+        ssl.SSLCertVerificationError("[SSL: CERTIFICATE_VERIFY_FAILED] unable to get issuer"),
+        "https://example.com/pos")
+    check("a verify failure names the clock and the store",
+          "date and time" in explained and "certificate store" in explained, explained[:70])
+    plain = explain_tls_error(ssl.SSLError("[SSL: WRONG_VERSION_NUMBER] wrong version number"), "https://x/pos")
+    check("a plaintext port is explained differently", "without TLS" in plain, plain[:60])
+
+    print("\n[12] helpers")
     import numpy as np
     frame = (np.random.default_rng(1).random((480, 640, 3)) * 255).astype(np.uint8)
     b64 = encode_frame(frame)

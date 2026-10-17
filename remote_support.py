@@ -24,9 +24,14 @@ is logged and refused.  A till handles money; a general-purpose backdoor on one
 is a liability whoever installs it, and a bounded set of support actions buys
 nearly all of the usefulness for a small fraction of the risk.
 
-Everything is outbound HTTPS to one address the owner types in themselves.
-Nothing listens on a port, nothing is open by default, and with no URL and no
-token configured this module starts no threads and sends nothing at all.
+Everything is outbound HTTPS to one address, and nothing ever listens on a
+port.  That address and the device key may be baked into the build - see
+support_config.py, and read the note there about what a secret in a shipped
+binary is and is not worth - because these tills are installed by someone who
+will not be typing a 32-character token into a machine they cannot reach.
+Anything in config.json overrides the baked-in values, ``support.enabled``
+turns the channel off for a particular till, and a build whose
+support_config.py is blank sends nothing until somebody fills the settings in.
 
 Dependencies: the standard library only, so it survives PyInstaller untouched.
 """
@@ -38,11 +43,15 @@ import logging
 import os
 import platform
 import socket
+import ssl
+import sys
 import threading
 import time
 import urllib.error
 import urllib.request
 from typing import Any, Callable, Dict, List, Optional
+
+import support_config
 
 log = logging.getLogger("support")
 
@@ -76,6 +85,59 @@ ACTIONS = {
 
 class SupportError(Exception):
     pass
+
+
+_ssl_lock = threading.Lock()
+_ssl_cache: Dict[str, "ssl.SSLContext"] = {}
+
+
+def ca_bundle() -> Optional[str]:
+    """The certificate bundle to trust, or None to use the machine's own.
+
+    This is the fix for a real failure on a shop's till: Python on Windows
+    reads whatever root certificates happen to be cached in the Windows store,
+    and - unlike a browser - it never triggers Windows' fetch-this-root-on-
+    demand update.  A till that has never had the relevant root pulled down
+    therefore fails to verify a perfectly good certificate, while the same URL
+    opens fine in Edge on the same machine.  Let's Encrypt's 2025 hierarchy
+    (Root YE under ISRG Root X2 under ISRG Root X1) is exactly the sort of
+    chain a stale store has not seen.
+
+    Shipping our own bundle takes the machine's store out of the picture.
+    """
+    try:
+        import certifi
+    except ImportError:
+        return None
+    path = certifi.where()
+    return path if os.path.isfile(path) else None
+
+
+def ssl_context(ca_file: str = "") -> "ssl.SSLContext":
+    """A verifying TLS context, preferring a bundle we ship over the machine's."""
+    key = ca_file or ca_bundle() or ""
+    with _ssl_lock:
+        context = _ssl_cache.get(key)
+        if context is None:
+            if key:
+                context = ssl.create_default_context(cafile=key)
+            else:
+                context = ssl.create_default_context()
+            _ssl_cache[key] = context
+        return context
+
+
+def explain_tls_error(exc: BaseException, url: str) -> str:
+    """Turn an SSL failure into something a shopkeeper can act on."""
+    detail = str(exc)
+    if isinstance(exc, ssl.SSLCertVerificationError) or "CERTIFICATE_VERIFY_FAILED" in detail:
+        return (f"the certificate of {url} could not be verified ({detail}). "
+                "This is usually an out-of-date Windows certificate store or a clock that is "
+                "wrong by more than a day: check the date and time on this machine first, then "
+                "Windows Update. The address itself is fine if it opens in a browser.")
+    if "WRONG_VERSION_NUMBER" in detail or "record layer" in detail:
+        return f"{url} answered without TLS - the address is probably http, or the port is wrong ({detail})"
+    return detail
 
 
 # --------------------------------------------------------------------------- #
@@ -151,11 +213,16 @@ class RemoteSupport:
     # ---- configuration
     @property
     def url(self) -> str:
-        return str(self.settings.get("support.url", "") or "").strip().rstrip("/")
+        """The configured address, or the one this build was made with."""
+        return (str(self.settings.get("support.url", "") or "").strip() or support_config.DEFAULT_URL).rstrip("/")
 
     @property
     def token(self) -> str:
-        return str(self.settings.get("support.token", "") or "").strip()
+        return str(self.settings.get("support.token", "") or "").strip() or support_config.DEFAULT_TOKEN
+
+    @property
+    def using_defaults(self) -> bool:
+        return not str(self.settings.get("support.url", "") or "").strip()
 
     @property
     def interval(self) -> float:
@@ -245,8 +312,17 @@ class RemoteSupport:
                                      headers={"Content-Type": "application/json",
                                               "Authorization": "Bearer " + self.token,
                                               "User-Agent": "AIPosScale-support/1"})
-        with self._opener(req, timeout=30) as resp:
-            raw = resp.read(MAX_BODY_BYTES).decode("utf-8", errors="replace")
+        context = ssl_context(str(self.settings.get("support.ca_file", "") or ""))
+        try:
+            with self._opener(req, timeout=30, context=context) as resp:
+                raw = resp.read(MAX_BODY_BYTES).decode("utf-8", errors="replace")
+        except ssl.SSLError as exc:
+            raise SupportError(explain_tls_error(exc, self.url)) from exc
+        except urllib.error.URLError as exc:
+            # urllib wraps the SSL failure, so the useful part is inside
+            if isinstance(exc.reason, ssl.SSLError):
+                raise SupportError(explain_tls_error(exc.reason, self.url)) from exc
+            raise
         if not raw.strip():
             return {}
         try:

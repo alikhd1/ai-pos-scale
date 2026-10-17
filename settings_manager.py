@@ -118,12 +118,17 @@ DEFAULTS: Dict[str, Dict[str, Any]] = {
     },
     "support": {
         # Outbound-only remote support, for a till nobody can walk up to.
-        # Off until the owner fills in both the URL and the token; see
-        # remote_support.py for what it does and, more importantly, what it
-        # deliberately cannot do.
-        "enabled": False,
-        "url": "",                        # https://host/path of the support service
-        "token": "",                      # shared secret, sent as a bearer token
+        # See remote_support.py for what it does and, more importantly, what
+        # it deliberately cannot do.
+        #
+        # On by default, because the address and the device key are baked into
+        # the build (support_config.py) and these tills are installed in shops
+        # by someone who will not type them in by hand.  A build with a blank
+        # support_config.py sends nothing regardless of this flag.
+        "enabled": True,
+        "url": "",                        # blank = the address this build was made with
+        "token": "",                      # blank = the device key this build was made with
+        "ca_file": "",                    # blank = the bundle we ship, then the machine's store
         "interval_min": 10,               # how often to post a snapshot
         "send_frames": True,              # include a small JPEG of the camera view
         "send_log": True,

@@ -154,9 +154,24 @@ picture formats it tried, what the scale reads, the exact banner on the screen a
 the till is refusing to sell, the invoice, the catalogue size, the tail of the log and a
 small picture of the camera view.
 
-Turn it on in **Settings > Remote support**. Nothing is sent until both the address and
-the token are filled in, and the page lists exactly what leaves the machine, each part
-switchable on its own.
+The address and the device key are baked into the build, in
+[`support_config.py`](support_config.py), so a till installed in a shop starts reporting
+with nothing typed in. **Settings > Remote support** shows which address is in use, lists
+exactly what leaves the machine with each part switchable on its own, and lets a
+particular till be pointed elsewhere or switched off without a new build. Blank out
+`support_config.py` and a build sends nothing until somebody fills the settings in.
+
+A token inside a shipped executable is not really a secret - anyone with the exe can read
+it out. That is why the service has two keys: the one in the build only lets a till post
+its own status, and cannot read another till, open the dashboard, or queue an action. The
+admin token that can do those things never leaves the server.
+
+TLS is verified against a CA bundle shipped with the app (`certifi`), not the machine's
+certificate store. This is not belt-and-braces: Python on Windows reads only the roots
+already cached in the Windows store and, unlike a browser, never triggers Windows' fetch
+-this-root-on-demand update, so a till that has never pulled down the relevant root fails
+to verify a perfectly good certificate while the same URL opens fine in Edge on that same
+machine. Point `support.ca_file` at your own bundle if you terminate TLS yourself.
 
 The service can also queue a short list of support actions, which the till picks up at
 its next check-in: `ping, snapshot, selftest, find_camera, find_scale, restart_camera,
@@ -184,6 +199,10 @@ page showing every till, its camera picture, its state, and a button per action.
 
 ## Troubleshooting
 
+* **The till says the certificate could not be verified.** Check the clock first: a date
+  more than a day out fails every certificate. The app trusts its own bundle rather than
+  the Windows store, so a stale store is no longer a cause, but a corporate proxy that
+  re-signs TLS is - point `support.ca_file` at that proxy's root.
 * **A till stopped reporting to the support service.** The dashboard greys out tills that
   have not checked in. Nothing can be done from this end: the channel is outbound only, so
   if the shop's internet is down or the app is closed, somebody has to be there. The till

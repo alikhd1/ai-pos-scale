@@ -76,6 +76,9 @@ settings.set("ai.db_file", os.path.join(TMP, "items.pkl"))
 settings.set("general.invoice_dir", os.path.join(TMP, "invoices"))
 settings.set("printer.interface", "file"); settings.set("printer.file_path", os.path.join(TMP, "receipt.bin"))
 settings.set("ai.motion_gate", False)
+# the shipped build reports to a real support service by default; a test
+# must never show up there as a till
+settings.set("support.enabled", False)
 settings.set("ai.fast_inference", False)          # keep the test quick and deterministic
 settings.set("pos.weighing_mode", "cumulative")
 settings.set("camera.tray_points", [[x / S.FRAME_W, y / S.FRAME_H] for x, y in S.TRAY_POLY])
@@ -254,7 +257,10 @@ try:
     check("an unknown setting is refused", _refuses(win, "set_setting", {"key": "pos.not_a_real_key", "value": 1}))
     win.support_action("set_setting", {"key": "ai.top_k", "value": 4})
     check("a known setting can be changed", int(win.settings.get("ai.top_k")) == 4)
-    check("the support channel is off by default", win.support is None or not win.support.configured())
+    check("the channel obeys the setting that turned it off",
+          win.support is None or not win.support.configured())
+    check("but the build does know where it would report",
+          bool(A.support_config.DEFAULT_URL), A.support_config.DEFAULT_URL)
 except Exception:
     traceback.print_exc(); results["ok"] = False
 finally:

@@ -9,6 +9,9 @@ torch>=2.2
 # loads the official torchvision checkpoint. Install it only for the equivalence test.
 PyQt6>=6.6
 pyserial>=3.5
+# the till verifies the support service against this bundle rather than the
+# Windows certificate store, which on an un-updated machine is missing roots
+certifi>=2024.2.2
 Pillow>=10.0
 pywin32>=306; sys_platform == "win32"
 

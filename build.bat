@@ -99,6 +99,8 @@ python -m PyInstaller --noconfirm --clean --log-level WARN ^
     --add-data "README.md;." ^
     --hidden-import torch ^
     --hidden-import sympy ^
+    --hidden-import certifi ^
+    --collect-data certifi ^
     --hidden-import serial ^
     --hidden-import serial.tools.list_ports ^
     --hidden-import serial.win32 ^

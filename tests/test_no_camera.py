@@ -46,6 +46,7 @@ settings = SettingsManager(os.path.join(TMP, "config.json"))
 settings.set("ai.db_file", os.path.join(TMP, "items.pkl"))
 settings.set("general.invoice_dir", os.path.join(TMP, "invoices"))
 settings.set("ai.fast_inference", False)
+settings.set("support.enabled", False)      # never report a test run as a real till
 settings.save()
 set_language("en")
 
