@@ -293,7 +293,8 @@ class TraySegmenter:
                  edge_abs: float = 12.0, edge_k: float = 2.5,
                  border_touch_tau: float = 0.16, touch_len_px: float = 8.0,
                  ring_len_px: float = 80.0, ring_frac: float = 0.15,
-                 intrusion_area_frac: float = 0.030):
+                 intrusion_area_frac: float = 0.030,
+                 stale_background_frac: float = 0.75):
         self.m = model
         self.min_area_frac, self.max_objects = min_area_frac, int(max_objects)
         self.split, self.saddle_ratio = split, saddle_ratio
@@ -306,6 +307,9 @@ class TraySegmenter:
         self.regrow = int(regrow)
         self.edge_abs, self.edge_k = edge_abs, edge_k
         self.border_touch_tau, self.intrusion_area_frac = border_touch_tau, intrusion_area_frac
+        # above this share of the tray changing at once, the reference is wrong
+        # rather than the tray being full: no arrangement of products covers it
+        self.stale_background_frac = stale_background_frac
         self.touch_len_px = touch_len_px
         self.ring_len_px, self.ring_frac = ring_len_px, ring_frac
         self._k3, self._k5, self._k7 = _ell(3), _ell(5), _ell(7)
@@ -576,8 +580,17 @@ class TraySegmenter:
                     regions.append(self._region(sub, a_j, touch, sk, a, ncc, sharp,
                                                 i if npieces > 1 else -1))
         regions.sort(key=lambda r: r.area_px, reverse=True)
+        # A reference that no longer matches the tray turns everything into one
+        # huge blob reaching past the edge, which reads as an arm. Nothing a
+        # customer puts down covers this much, so call it what it is.
+        changed_frac = float(np.count_nonzero((fg > 0) & (m.mask > 0))) / max(1, m.tray_area_work)
+        stale = changed_frac >= self.stale_background_frac
+        if stale:
+            intrusion = False
+            regions = []
         res = SegmentResult(regions[:self.max_objects], intrusion, shadows, coverage,
-                            empty=not regions and not intrusion, unreliable=not ok)
+                            empty=not regions and not intrusion and not stale,
+                            unreliable=(not ok) or stale)
         res.ms = (time.perf_counter() - t0) * 1000.0
         return res
 

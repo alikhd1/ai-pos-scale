@@ -169,6 +169,54 @@ def test_timing():
           f"(limit {REFERENCE_RATIO * RATIO_CEILING:.0f}), {median:.1f} ms median")
 
 
+def test_stale_background_is_not_a_hand():
+    """Light that moved since the capture must not be reported as an arm.
+
+    From a real till: one product was placed and the app said "take your hand
+    off the tray", finding nothing. Measuring its own frame against its own
+    reference showed plain paper away from the product reading 23 to 38 levels
+    brighter, against a tolerance near 16. The light had changed since the
+    reference was captured, and the shift was a gradient across the frame that
+    a single gain and offset cannot undo. Nine tenths of the tray counted as
+    changed, that one blob reached past the tray edge, and "reaching in from
+    outside" is what the code calls an arm.
+
+    What is pinned here is the rule, not the optics: when nearly the whole tray
+    reads as changed, the reference is stale - no arrangement of products
+    covers that much - so say so instead of blaming a hand. Reproducing the
+    gradient synthetically does not work, because this fixture's background is
+    textured and the photometric alignment copes with it; the evidence that
+    the rule matches reality is the till's own frame, which went from
+    intrusion=True to unreliable=True with no regions either way.
+    """
+    print("\n[8] a reference the tray no longer matches reads as stale, not as a hand")
+    model, seg = build()
+    print(f"     stale above {100 * seg.stale_background_frac:.0f}% of the tray changing at once")
+
+    # a view the reference cannot explain at all
+    nothing_alike = (255 - S.scene([], seed=11)).astype(np.uint8)
+    res = seg.segment(nothing_alike)
+    check("it is not called an intrusion", res.intrusion is False, str(res.intrusion))
+    check("it is flagged unreliable", res.unreliable is True, str(res.unreliable))
+    check("not reported as a clean empty tray", res.empty is False, str(res.empty))
+    check("and offers no phantom products", len(res.regions) == 0, str(len(res.regions)))
+
+    # the two things it must still tell apart
+    model2, seg2 = build()
+    res_hand = seg2.segment(S.scene([((300, 240), S.CLASSES[0], 0.0, 1.0)], hand=True, seed=12))
+    check("a real hand is still an intrusion", res_hand.intrusion is True,
+          f"intrusion={res_hand.intrusion} unreliable={res_hand.unreliable}")
+    check("and a hand is not mistaken for a stale reference", res_hand.unreliable is False,
+          str(res_hand.unreliable))
+
+    model3, seg3 = build()
+    res_full = seg3.segment(S.scene([(p, S.CLASSES[i], 0.0, 1.0)
+                                     for i, p in enumerate(S.positions(5, seed=13))], seed=13))
+    check("a tray full of products is not called stale", res_full.unreliable is False,
+          f"regions={len(res_full.regions)} unreliable={res_full.unreliable}")
+    check("and they are all still found", len(res_full.regions) >= 3, str(len(res_full.regions)))
+
+
 def test_stability_report():
     """A reference built from an unsteady view has to admit it.
 
@@ -179,7 +227,7 @@ def test_stability_report():
     read "good", and a view that jitters in brightness between captures - which
     is what a glossy surface plus a hunting auto-exposure produces - must not.
     """
-    print("\n[8] an unsteady view is reported, not silently accepted")
+    print("\n[9] an unsteady view is reported, not silently accepted")
     steady, _ = build()
     good = steady.stability()
     print(f"     steady view: median {good['median']:.1f}, {100 * good['fraction_noisy']:.0f}% noisy "
@@ -239,6 +287,7 @@ def main() -> int:
     test_hand_intrusion()
     test_lighting_drift()
     test_timing()
+    test_stale_background_is_not_a_hand()
     test_stability_report()
     test_no_model_is_off_not_wrong()
     test_persistence()
