@@ -114,12 +114,16 @@ def main() -> int:
     # ---------------------------------------------------------------- certifi
     print("\n--- certificates ---")
     bundle = remote_support.ca_bundle()
-    if bundle:
-        say(OK, f"shipping our own bundle: {bundle}")
+    shipped = remote_support.shipped_roots()
+    if bundle and shipped and os.path.abspath(bundle) == os.path.abspath(shipped):
+        say(OK, f"certifi is not installed; using the roots shipped with the app: {bundle}")
+    elif bundle:
+        say(OK, f"verifying against certifi: {bundle}")
     else:
-        say(BAD, "certifi is NOT installed, so TLS falls back to the Windows certificate "
-                 "store - that is what caused the original SSL error.\n"
-                 "         fix:  python -m pip install -r requirements.txt")
+        say(BAD, "no certificate bundle at all, so TLS falls back to the Windows "
+                 "certificate store - that is what caused the original SSL error.\n"
+                 "         certs/support-roots.pem is missing, so run:  git pull\n"
+                 "         or install certifi:  python -m pip install -r requirements.txt")
 
     drift = abs(time.time() - time.mktime(time.gmtime()) - (time.altzone if time.daylight else time.timezone) * -1)
     print(f"       machine clock {time.strftime('%Y-%m-%d %H:%M:%S %Z')}")

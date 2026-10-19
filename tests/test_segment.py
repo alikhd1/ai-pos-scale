@@ -110,18 +110,62 @@ def test_lighting_drift():
                   f"unreliable={r.unreliable} count={r.count}")
 
 
+#: segmentation cost divided by the calibration cost, measured on an idle
+#: reference machine. A ratio rather than milliseconds, because the two are
+#: timed alternately and a machine that slows down moves both together.
+REFERENCE_RATIO = 3.0
+#: how far past that is still allowed. Deliberately loose: this exists to catch
+#: segmentation becoming fundamentally slower, not to police a few per cent.
+RATIO_CEILING = 4.0
+
+
+def calibration_ms() -> float:
+    """Time a fixed lump of array work: a stand-in for 'how fast is this box now'.
+
+    The same shape of work segmentation does - float maths over a few hundred
+    thousand pixels - so load and CPU speed move this and the measurement
+    together.
+    """
+    rng = np.random.default_rng(0)
+    a = rng.random((480, 640), dtype=np.float32)
+    b = rng.random((480, 640), dtype=np.float32)
+    t = time.perf_counter()
+    for _ in range(6):
+        np.sqrt(np.abs(a - b) + 1.0).sum()
+    return (time.perf_counter() - t) * 1000
+
+
 def test_timing():
+    """Report the per-frame cost, and fail only on a real regression.
+
+    An absolute millisecond budget was tried first and had to go: on this
+    project's VM the same code measured 22 ms on one run and 100 ms on the
+    next, so the check went red at random and the honest reading of a red
+    result became "probably just load" - which is exactly how a genuine
+    regression gets waved through. Calibration and segmentation are now timed
+    alternately and compared as a ratio, and the threshold is loose enough that
+    only something structural trips it.
+    """
     print("\n[5] per-frame cost")
     model, seg = build()
     img = S.scene([(p, S.CLASSES[i], 0.0, 1.0) for i, p in enumerate(S.positions(3, seed=3))], seed=3)
     seg.segment(img)
-    times = []
+    times, ratios = [], []
     for _ in range(12):
+        calib = calibration_ms()
         t = time.perf_counter()
         seg.segment(img)
-        times.append((time.perf_counter() - t) * 1000)
-    mean, p95 = float(np.mean(times)), float(np.percentile(times, 95))
-    check("mean frame cost stays in budget", mean <= 60.0, f"{mean:.1f} ms mean, {p95:.1f} ms p95")
+        frame_ms = (time.perf_counter() - t) * 1000
+        times.append(frame_ms)
+        ratios.append(frame_ms / max(calib, 0.01))
+    median, p95 = float(np.median(times)), float(np.percentile(times, 95))
+    ratio = float(np.median(ratios))
+    print(f"     {median:.1f} ms median, {p95:.1f} ms p95 on this machine "
+          f"(work ratio {ratio:.1f}, reference {REFERENCE_RATIO})")
+    check("segmentation has not become structurally slower",
+          ratio <= REFERENCE_RATIO * RATIO_CEILING,
+          f"ratio {ratio:.1f} vs reference {REFERENCE_RATIO} "
+          f"(limit {REFERENCE_RATIO * RATIO_CEILING:.0f}), {median:.1f} ms median")
 
 
 def test_no_model_is_off_not_wrong():

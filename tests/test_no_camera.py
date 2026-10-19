@@ -21,6 +21,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT); sys.path.insert(0, os.path.join(ROOT, "tests"))
 os.chdir(ROOT)
 
+import time
 import app as A
 import rtk_camera as RC
 from ai_engine import Recognition
@@ -80,7 +81,37 @@ try:
     win._update_blocking()
     check("Add is blocked by the hand", not win.add_btn.isEnabled())
 
-    print("\n[4] the camera search gives up quickly when there is nothing there")
+    print("\n[4] a remote action works from a worker thread, not just the main one")
+    # the bug this covers shipped and was only caught on a real till: _on_ui
+    # used QTimer.singleShot, which Qt silently ignores when it is called from
+    # a thread that does not own the object, so every UI-touching remote action
+    # timed out after 90s. The tests ran support_action on the main thread,
+    # where the inline fast path hides it entirely.
+    import threading as _th
+    box = {}
+
+    def from_worker():
+        try:
+            box["setting"] = win.support_action("set_setting", {"key": "ai.top_k", "value": 5})
+            box["ping"] = win.support_action("ping", {})
+        except Exception as exc:
+            box["error"] = exc
+
+    worker = _th.Thread(target=from_worker, daemon=True)
+    worker.start()
+    # the GUI thread has to keep pumping or the queued call never lands
+    deadline = time.time() + 30
+    while worker.is_alive() and time.time() < deadline:
+        _QAPP.processEvents()
+        time.sleep(0.01)
+    worker.join(timeout=5)
+    check("the worker finished instead of hanging", not worker.is_alive(), "still blocked in _on_ui")
+    check("no timeout off the main thread", "error" not in box, str(box.get("error")))
+    check("the action actually ran", box.get("ping", {}).get("pong") is True, str(box.get("ping")))
+    check("and it reached the settings", int(win.settings.get("ai.top_k")) == 5,
+          str(win.settings.get("ai.top_k")))
+
+    print("\n[5] the camera search gives up quickly when there is nothing there")
     import time
     t0 = time.time()
     try:

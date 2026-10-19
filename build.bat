@@ -96,6 +96,7 @@ python -m PyInstaller --noconfirm --clean --log-level WARN ^
     --%MODE% ^
     %ADD_BIN% ^
     --add-data "models;models" ^
+    --add-data "certs;certs" ^
     --add-data "README.md;." ^
     --hidden-import torch ^
     --hidden-import sympy ^

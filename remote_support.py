@@ -91,6 +91,13 @@ _ssl_lock = threading.Lock()
 _ssl_cache: Dict[str, "ssl.SSLContext"] = {}
 
 
+def shipped_roots() -> Optional[str]:
+    """The small root bundle committed next to the code, if it is there."""
+    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    path = os.path.join(base, "certs", "support-roots.pem")
+    return path if os.path.isfile(path) else None
+
+
 def ca_bundle() -> Optional[str]:
     """The certificate bundle to trust, or None to use the machine's own.
 
@@ -104,13 +111,25 @@ def ca_bundle() -> Optional[str]:
     chain a stale store has not seen.
 
     Shipping our own bundle takes the machine's store out of the picture.
+
+    Falling back to certifi alone was not enough: certifi arrives through
+    `pip install -r requirements.txt`, and a till updated with `git pull` and
+    nothing else still had no bundle and still failed in exactly the same way.
+    So a small bundle of the roots this service needs is committed next to the
+    code and used whenever certifi is missing.  Updating is then one step, not
+    two, and forgetting the second one cannot bring the fault back.
     """
     try:
         import certifi
+        path = certifi.where()
+        if os.path.isfile(path):
+            return path
     except ImportError:
-        return None
-    path = certifi.where()
-    return path if os.path.isfile(path) else None
+        pass
+    shipped = shipped_roots()
+    if shipped:
+        log.info("certifi is not installed; verifying TLS against %s", shipped)
+    return shipped
 
 
 def ssl_context(ca_file: str = "") -> "ssl.SSLContext":
@@ -131,10 +150,16 @@ def explain_tls_error(exc: BaseException, url: str) -> str:
     """Turn an SSL failure into something a shopkeeper can act on."""
     detail = str(exc)
     if isinstance(exc, ssl.SSLCertVerificationError) or "CERTIFICATE_VERIFY_FAILED" in detail:
-        return (f"the certificate of {url} could not be verified ({detail}). "
-                "This is usually an out-of-date Windows certificate store or a clock that is "
-                "wrong by more than a day: check the date and time on this machine first, then "
-                "Windows Update. The address itself is fine if it opens in a browser.")
+        # ordered by what actually happens: the first till to hit this had its
+        # clock two days out, which no certificate bundle can survive
+        return (f"the certificate of {url} could not be verified. "
+                "CHECK THE DATE AND TIME ON THIS MACHINE FIRST - a clock wrong by more than a "
+                "day fails every certificate, and that is the most common cause by far. "
+                "Otherwise: something on the network may be re-signing TLS (a company proxy, "
+                "an antivirus that inspects HTTPS, a filtering middlebox), in which case export "
+                "its root certificate and point the support.ca_file setting at it. "
+                "Run check_support.py for a layer-by-layer answer. "
+                f"[{detail}]")
     if "WRONG_VERSION_NUMBER" in detail or "record layer" in detail:
         return f"{url} answered without TLS - the address is probably http, or the port is wrong ({detail})"
     return detail
@@ -205,6 +230,7 @@ class RemoteSupport:
         self._stop = threading.Event()
         self._wake = threading.Event()
         self._pending: List[Dict[str, Any]] = []       # results waiting to go up
+        self._first_delay = 0.0
         self._lock = threading.Lock()
         self.last_error = ""
         self.last_sent = 0.0
@@ -233,8 +259,14 @@ class RemoteSupport:
         return bool(self.settings.get("support.enabled", False)) and bool(self.url) and bool(self.token)
 
     # ---- lifecycle
-    def start(self) -> bool:
-        """Start the channel.  Returns False when it is not configured."""
+    def start(self, first_delay: float = 0.0) -> bool:
+        """Start the channel.  Returns False when it is not configured.
+
+        ``first_delay`` holds the opening snapshot back, because the camera and
+        the model come up on their own threads and a snapshot taken before them
+        describes a till that does not exist yet.  ``send_now()`` cuts it short,
+        which is what the app does once those are actually ready.
+        """
         if self._thread is not None:
             return True
         if not self.configured():
@@ -245,6 +277,7 @@ class RemoteSupport:
             self.last_error = "the support URL must be https"
             return False
         self._stop.clear()
+        self._first_delay = max(0.0, float(first_delay))
         self._thread = threading.Thread(target=self._loop, name="RemoteSupport", daemon=True)
         self._thread.start()
         log.info("remote support on, posting to %s every %.0f min", self.url, self.interval / 60)
@@ -269,6 +302,10 @@ class RemoteSupport:
     # ---- the loop
     def _loop(self) -> None:
         backoff = 0.0
+        if self._first_delay:
+            # cut short by send_now() as soon as the camera and model report in
+            self._wake.wait(self._first_delay)
+            self._wake.clear()
         while not self._stop.is_set():
             try:
                 actions = self._post_snapshot()

@@ -53,6 +53,9 @@ class Settings:
 
 
 # --------------------------------------------------------------- fake service
+# generous waits: these check that a thing happens, not how fast. A 10s
+# window went red on a loaded machine and passed on a quiet one, which is
+# the worst kind of test.
 RECEIVED = []
 QUEUED = []          # actions the service hands back on the next snapshot
 AUTH = "Bearer secret-token"
@@ -111,7 +114,7 @@ try:
     print("\n[3] a snapshot reaches the service")
     channel = RemoteSupport(Settings(url=URL, token="secret-token"), snapshot, run_action)
     check("starts when configured", channel.start() is True)
-    deadline = time.time() + 10
+    deadline = time.time() + 30
     while not RECEIVED and time.time() < deadline:
         time.sleep(0.05)
     check("snapshot arrived", len(RECEIVED) == 1, str(len(RECEIVED)))
@@ -123,7 +126,7 @@ try:
     print("\n[4] the service can ask for an allowed action")
     QUEUED.append({"id": "a1", "name": "ping"})
     channel.send_now()
-    deadline = time.time() + 10
+    deadline = time.time() + 30
     while len(RECEIVED) < 3 and time.time() < deadline:
         time.sleep(0.05)
     results = [r for body in RECEIVED for r in body.get("results", [])]
@@ -134,7 +137,7 @@ try:
     RAN.clear()
     QUEUED.append({"id": "a2", "name": "rm -rf /"})
     channel.send_now()
-    deadline = time.time() + 10
+    deadline = time.time() + 30
     while not any(r.get("id") == "a2" for body in RECEIVED for r in body.get("results", [])) and time.time() < deadline:
         time.sleep(0.05)
     results = [r for body in RECEIVED for r in body.get("results", [])]
@@ -149,7 +152,7 @@ try:
     channel = RemoteSupport(Settings(url=URL, token="secret-token", allow_actions=False), snapshot, run_action)
     QUEUED.append({"id": "a3", "name": "selftest"})
     channel.start()
-    deadline = time.time() + 10
+    deadline = time.time() + 30
     while not any(r.get("id") == "a3" for body in RECEIVED for r in body.get("results", [])) and time.time() < deadline:
         time.sleep(0.05)
     results = [r for body in RECEIVED for r in body.get("results", [])]
@@ -206,7 +209,7 @@ try:
         check("and the built-in key", channel.token == "secret-token")
         check("it knows it is on defaults", channel.using_defaults is True)
         check("it starts with an empty config", channel.start() is True)
-        deadline = time.time() + 10
+        deadline = time.time() + 30
         while not RECEIVED and time.time() < deadline:
             time.sleep(0.05)
         check("and reports in", len(RECEIVED) >= 1, str(len(RECEIVED)))
@@ -232,8 +235,12 @@ try:
     explained = explain_tls_error(
         ssl.SSLCertVerificationError("[SSL: CERTIFICATE_VERIFY_FAILED] unable to get issuer"),
         "https://example.com/pos")
-    check("a verify failure names the clock and the store",
-          "date and time" in explained and "certificate store" in explained, explained[:70])
+    # a real till failed this way and the cause was its clock, so that has to be
+    # the first thing the message says, not a footnote after the trust store
+    check("a verify failure puts the clock first",
+          "DATE AND TIME" in explained and explained.index("DATE AND TIME") < 120, explained[:90])
+    check("and still mentions a re-signing proxy", "proxy" in explained)
+    check("and points at the diagnostic", "check_support.py" in explained)
     plain = explain_tls_error(ssl.SSLError("[SSL: WRONG_VERSION_NUMBER] wrong version number"), "https://x/pos")
     check("a plaintext port is explained differently", "without TLS" in plain, plain[:60])
 

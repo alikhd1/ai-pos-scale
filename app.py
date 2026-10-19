@@ -424,6 +424,7 @@ class Bus(QObject):
     camera_ready = pyqtSignal(object)            # CameraOpenResult
     camera_found = pyqtSignal(object)            # find_camera() report
     scale_found = pyqtSignal(object)             # find_scale() report
+    run_on_ui = pyqtSignal(object)               # a callable to run on the GUI thread
     toast = pyqtSignal(str, bool)                # message, is_error
     print_done = pyqtSignal(bool, str)
     dialog_result = pyqtSignal(str, str, bool)   # kind, text, is_error  (settings dialog workers)
@@ -2207,6 +2208,7 @@ class MainWindow(QMainWindow):
         self.bus.camera_ready.connect(self.on_camera_ready)
         self.bus.camera_found.connect(self.on_camera_found)
         self.bus.scale_found.connect(self.on_scale_found)
+        self.bus.run_on_ui.connect(lambda fn: fn())
         self.bus.toast.connect(self.on_toast)
         self.bus.print_done.connect(self.on_print_done)
         self.bus.embedding_ready.connect(self.on_embedding)
@@ -2254,7 +2256,10 @@ class MainWindow(QMainWindow):
         """Start the outbound support channel, if the owner configured one."""
         self.stop_support()
         self.support = RemoteSupport(self.settings, self.support_snapshot, self.support_action)
-        if self.support.start():
+        # the camera and the model are still coming up; a snapshot now would
+        # describe a till that has not finished starting. Ninety seconds is
+        # past a slow model load, and camera/model readiness cuts it short.
+        if self.support.start(first_delay=90.0):
             self.status.showMessage(tr("support_on", url=self.support.url), 8000)
 
     def stop_support(self):
@@ -2411,7 +2416,10 @@ class MainWindow(QMainWindow):
             finally:
                 done.set()
 
-        QTimer.singleShot(0, wrapper)
+        # NOT QTimer.singleShot: a timer started from a worker thread is
+        # silently ignored by Qt, so the wait below always timed out. A queued
+        # signal is the supported way to hop threads.
+        self.bus.run_on_ui.emit(wrapper)
         if not done.wait(timeout):
             raise TimeoutError("the application did not answer in time")
         if "error" in box:
@@ -2459,6 +2467,12 @@ class MainWindow(QMainWindow):
             log.info("camera note: %s", n)
         if cam.get("backend") in ("auto", "rtk") and res.backend == "opencv" and any("32-bit" in n for n in res.notes):
             self.status.showMessage(tr("rtk_fallback_status"), 10000)
+        self._support_push()
+
+    def _support_push(self):
+        """Report now rather than at the next tick: something worth seeing changed."""
+        if self.support:
+            self.support.send_now()
 
     def retry_camera(self):
         """Look for a camera again, trying every device index this time."""
@@ -2552,6 +2566,7 @@ class MainWindow(QMainWindow):
         if self.db.backbone_mismatch:
             msg_error(self, tr("retrain_needed"))
         self.status.showMessage(tr("model_ready"), 5000)
+        self._support_push()
 
     def stop_scale(self):
         if self.scale:
