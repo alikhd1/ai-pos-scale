@@ -210,6 +210,29 @@ class EmptyTrayModel:
             cv2.fillPoly(mask, [pts.reshape(-1, 1, 2)], 255)
         return cls(bg, sigma, mask, bbox, (w_full, h_full))
 
+    def stability(self) -> Dict[str, Any]:
+        """How usable this reference is, as a number and a verdict.
+
+        ``sigma`` is how much a pixel may move before it counts as a change. On
+        a steady view under steady light it sits in the low single digits. When
+        it climbs into the tens, nothing can be detected reliably: the model has
+        been told that enormous swings are normal, so real objects stop standing
+        out and reflections start to. The usual causes are a glossy or curved
+        surface whose highlights move, and a webcam whose auto-exposure and
+        auto-white-balance never stop hunting.
+        """
+        inside = self.sigma[self.idx] if self.tray_area_work else self.sigma.reshape(-1)
+        median = float(np.median(inside)) if inside.size else 0.0
+        p95 = float(np.percentile(inside, 95)) if inside.size else 0.0
+        if median <= 8.0:
+            verdict = "good"
+        elif median <= 16.0:
+            verdict = "marginal"
+        else:
+            verdict = "unusable"
+        return {"median": median, "p95": p95, "verdict": verdict,
+                "fraction_noisy": float((inside > 16.0).mean()) if inside.size else 0.0}
+
     # ---- persistence -------------------------------------------------------
     def to_payload(self) -> Dict[str, Any]:
         """Compact, picklable representation (~55 KB) for items_db.pkl."""

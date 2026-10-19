@@ -41,6 +41,11 @@ DEFAULTS: Dict[str, Dict[str, Any]] = {
     "camera": {
         "backend": "auto",                # "auto" | "rtk" | "opencv"
         "device_index": 0,
+        # Let the camera settle, then stop its auto-exposure and auto-white-
+        # balance hunting, which is half of why an empty-tray reference drifts.
+        # Off by default: a camera that locks at a bad value is worse than one
+        # that hunts, so switch it on per machine once it is seen to help.
+        "lock_exposure": False,
         "width": 640,
         "height": 480,
         "mirror": False,

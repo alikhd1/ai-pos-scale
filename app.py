@@ -1936,6 +1936,7 @@ class MainWindow(QMainWindow):
         self.camera_thread: Optional[CameraThread] = None
         self.camera_result = None
         self.camera_ok = False
+        self._bg_stability = None
         self.support = None
         self.engine: Optional[RecognitionEngine] = None
         self.extractor: Optional[FeatureExtractor] = None
@@ -2309,7 +2310,8 @@ class MainWindow(QMainWindow):
                 "tray_kg": None if self.tray_weight() is None else round(self.tray_weight(), 4),
                 "difference_kg": None if self.weight_difference() is None else round(self.weight_difference(), 4),
             },
-            "catalogue": {"items": len(self.db), "has_empty_tray": bool(self.db.has_background_image)},
+            "catalogue": {"items": len(self.db), "has_empty_tray": bool(self.db.has_background_image),
+                          "tray_stability": self._bg_stability or self._stability_of_loaded_model()},
             "engine": {
                 "loaded": self.engine is not None,
                 "paused": bool(getattr(self.engine, "paused", False)) if self.engine else None,
@@ -2331,6 +2333,14 @@ class MainWindow(QMainWindow):
         if self.settings.get("support.send_log", True):
             snap["log_tail"] = log_tail(data_path("aipos.log"), 200)
         return snap
+
+    def _stability_of_loaded_model(self):
+        """Stability of whatever reference is in use, even one loaded from disk."""
+        model = getattr(getattr(self.engine, "segmenter", None), "m", None)   # TraySegmenter keeps it as .m
+        try:
+            return model.stability() if model is not None else None
+        except Exception:
+            return None
 
     def support_action(self, name: str, args: dict) -> dict:
         """Run one of the actions in remote_support.ACTIONS. Nothing else.
@@ -2434,7 +2444,8 @@ class MainWindow(QMainWindow):
 
         def work():
             res = open_camera(cam["backend"], int(cam["device_index"]), int(cam["width"]), int(cam["height"]),
-                              cam.get("sdk_dll", "RTKCamSDK.dll"), self.video_override or cam.get("video_file", ""))
+                              cam.get("sdk_dll", "RTKCamSDK.dll"), self.video_override or cam.get("video_file", ""),
+                              lock_exposure=bool(cam.get("lock_exposure", False)))
             self.bus.camera_ready.emit(res)
 
         threading.Thread(target=work, name="CameraOpener", daemon=True).start()
@@ -3224,6 +3235,17 @@ class MainWindow(QMainWindow):
             log.exception("empty-tray model failed")
             msg_error(self, str(exc))
             return
+
+        # A reference can be built from a view that is far too unstable to
+        # detect anything in, and until now the app said "captured" and left
+        # the operator to discover that nothing works. Measure it and say so.
+        self._bg_stability = model.stability()
+        log.info("empty-tray stability: %s", self._bg_stability)
+        if self._bg_stability["verdict"] == "unusable":
+            msg_error(self, tr("tray_unstable", median=self._bg_stability["median"],
+                               percent=100.0 * self._bg_stability["fraction_noisy"]))
+        elif self._bg_stability["verdict"] == "marginal":
+            msg_info(self, tr("tray_marginal", median=self._bg_stability["median"]))
         crop, _ = self.tray.crop(frames[-1])
         self._bg_thumb = make_thumbnail(crop, 96)
         self._bg_pending = []

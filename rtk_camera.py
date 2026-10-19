@@ -560,10 +560,13 @@ class OpenCVCameraSource(CameraSource):
     """cv2.VideoCapture based source. ``video_file`` turns it into a looping virtual camera."""
     name = "opencv"
 
-    def __init__(self, device_index: int = 0, width: int = 640, height: int = 480, video_file: str = ""):
+    def __init__(self, device_index: int = 0, width: int = 640, height: int = 480, video_file: str = "",
+                 lock_exposure: bool = False):
         self.device_index, self.width, self.height, self.video_file = device_index, width, height, video_file
         self.cap: Optional["cv2.VideoCapture"] = None
         self.attempts: List[str] = []
+        self.lock_exposure = bool(lock_exposure)
+        self.lock_notes: List[str] = []
         self._is_file = bool(video_file)
         self._lock = threading.Lock()
 
@@ -669,6 +672,48 @@ class OpenCVCameraSource(CameraSource):
         src = os.path.basename(self.video_file) if self._is_file else f"device {self.device_index}"
         self.description = f"OpenCV/{label} - {src} {w}x{h} ({how})"
         log.info("camera opened: %s", self.description)
+        if self.lock_exposure and not self._is_file:
+            self.lock_notes = self._freeze_auto(cap)
+            for note in self.lock_notes:
+                log.info("camera: %s", note)
+
+    @staticmethod
+    def _freeze_auto(cap, settle: float = 2.0) -> List[str]:
+        """Let auto-exposure and auto-white-balance settle, then switch them off.
+
+        Deliberately forgiving. UVC cameras disagree about what the values even
+        mean - DirectShow wants 0.25 for manual where Media Foundation wants 0 -
+        and plenty simply ignore the write. So each step is attempted, read back,
+        and reported; nothing here is allowed to stop the camera working.
+        """
+        notes: List[str] = []
+        deadline = time.time() + settle
+        while time.time() < deadline:            # let the camera find its own exposure first
+            cap.read()
+
+        for prop_name, auto_prop, value_prop in (("exposure", cv2.CAP_PROP_AUTO_EXPOSURE, cv2.CAP_PROP_EXPOSURE),
+                                                 ("white balance", getattr(cv2, "CAP_PROP_AUTO_WB", None),
+                                                  getattr(cv2, "CAP_PROP_WB_TEMPERATURE", None))):
+            if auto_prop is None:
+                continue
+            try:
+                settled = cap.get(value_prop) if value_prop is not None else None
+                before = cap.get(auto_prop)
+                # 0.25 is DirectShow's "manual"; 0 is what Media Foundation wants
+                for manual in (0.25, 0.0):
+                    cap.set(auto_prop, manual)
+                    if abs(cap.get(auto_prop) - before) > 1e-6:
+                        break
+                if value_prop is not None and settled is not None:
+                    cap.set(value_prop, settled)
+                after = cap.get(auto_prop)
+                if abs(after - before) > 1e-6:
+                    notes.append(f"{prop_name} locked at {settled} (auto {before} -> {after})")
+                else:
+                    notes.append(f"{prop_name} could NOT be locked, the camera keeps adjusting it")
+            except Exception as exc:
+                notes.append(f"{prop_name} lock failed: {exc}")
+        return notes
 
     def read(self) -> Optional[np.ndarray]:
         with self._lock:
@@ -769,7 +814,8 @@ class CameraOpenResult:
 
 
 def open_camera(backend: str = "auto", device_index: int = 0, width: int = 640, height: int = 480,
-                dll: str = "RTKCamSDK.dll", video_file: str = "") -> CameraOpenResult:
+                dll: str = "RTKCamSDK.dll", video_file: str = "",
+                lock_exposure: bool = False) -> CameraOpenResult:
     """Apply the fallback policy: RTK SDK -> OpenCV -> placeholder.
 
     ``backend``: "auto" (default), "rtk" (SDK only, still falls back with a note) or "opencv".
@@ -794,10 +840,10 @@ def open_camera(backend: str = "auto", device_index: int = 0, width: int = 640, 
             log.warning("RTK SDK unavailable, falling back to OpenCV: %s", exc)
 
     if backend in ("auto", "rtk", "opencv"):
-        cv = OpenCVCameraSource(device_index, width, height)
+        cv = OpenCVCameraSource(device_index, width, height, lock_exposure=lock_exposure)
         try:
             cv.open()
-            return CameraOpenResult(cv, "opencv", cv.description, notes)
+            return CameraOpenResult(cv, "opencv", cv.description, notes + list(cv.lock_notes))
         except Exception as exc:
             cv.close()
             notes.append(f"OpenCV failed: {exc}")

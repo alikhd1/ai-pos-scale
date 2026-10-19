@@ -292,6 +292,21 @@ STRINGS = {
                      "تا وقتی آدرس و کلید را وارد نکنید هیچ چیزی ارسال نمی‌شود. صندوق فقط ارسال می‌کند و "
                      "هرگز پورتی باز نمی‌کند، و سرویس فقط می‌تواند همان فهرست ثابت کارهای پشتیبانی را "
                      "درخواست کند — امکان اجرای دستور روی این کامپیوتر وجود ندارد."),
+    "tray_unstable": ("This view is not steady enough to detect anything reliably "
+                      "(noise {median:.0f}, {percent:.0f}% of the tray). The usual cause is a shiny or "
+                      "curved surface whose reflections move, or a camera that keeps changing its own "
+                      "exposure. Put a flat matte sheet over the tray area, tape it down so it cannot "
+                      "shift, keep the light steady, and capture again.",
+                      "این نما آن‌قدر ثابت نیست که تشخیص قابل اعتماد باشد "
+                      "(نویز {median:.0f}، {percent:.0f}٪ از سینی). علت معمولش سطح براق یا قوسی است که "
+                      "بازتاب‌هایش جابه‌جا می‌شود، یا دوربینی که مدام نوردهی خودش را عوض می‌کند. یک "
+                      "سطح صاف و مات روی ناحیه سینی بگذارید و بچسبانید که تکان نخورد، نور را ثابت "
+                      "نگه دارید و دوباره ثبت کنید."),
+    "tray_marginal": ("The empty tray was captured, but this view is only just steady enough "
+                      "(noise {median:.0f}). Detection will be unreliable. A flat matte surface and "
+                      "steady light would fix it.",
+                      "سینی خالی ثبت شد، اما این نما به‌سختی به حد لازم می‌رسد (نویز {median:.0f}). "
+                      "تشخیص قابل اتکا نخواهد بود. یک سطح صاف و مات با نور ثابت حلش می‌کند."),
     "camera_dead": ("No camera - the till is in manual mode, pick products from the list",
                     "دوربین کار نمی‌کند — صندوق در حالت دستی است؛ کالا را از فهرست انتخاب کنید"),
     "camera_retry": ("Try the camera again", "تلاش دوباره برای دوربین"),

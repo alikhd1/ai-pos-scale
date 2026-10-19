@@ -27,6 +27,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import numpy as np
 import scene as S
 from tray_segment import EmptyTrayModel, RegionTracker, TraySegmenter
+from ai_engine import TrayRegion
 
 CHECKS = []
 
@@ -168,6 +169,45 @@ def test_timing():
           f"(limit {REFERENCE_RATIO * RATIO_CEILING:.0f}), {median:.1f} ms median")
 
 
+def test_stability_report():
+    """A reference built from an unsteady view has to admit it.
+
+    A real till built one whose noise estimate was saturated across a third of
+    the tray and the app reported success; everything after that was
+    meaningless, and from the shop it looked like "the camera does not detect
+    my goods". The numbers here bracket that case: a steady synthetic view must
+    read "good", and a view that jitters in brightness between captures - which
+    is what a glossy surface plus a hunting auto-exposure produces - must not.
+    """
+    print("\n[8] an unsteady view is reported, not silently accepted")
+    steady, _ = build()
+    good = steady.stability()
+    print(f"     steady view: median {good['median']:.1f}, {100 * good['fraction_noisy']:.0f}% noisy "
+          f"-> {good['verdict']}")
+    check("a steady view reads good", good["verdict"] == "good", str(good))
+
+    # the same tray, but each capture at a different exposure and tint, which
+    # is exactly what an auto-exposing camera on a shiny surface delivers
+    frames = []
+    for i in range(6):
+        f = S.scene([], seed=i).astype(np.float32)
+        gain = 1.0 + 0.30 * ((i % 3) - 1)
+        f[:, :, 0] *= gain * 1.08
+        f[:, :, 2] *= gain * 0.92
+        frames.append(np.clip(f * gain, 0, 255).astype(np.uint8))
+    h, w = frames[0].shape[:2]
+    tray = TrayRegion([(x / S.FRAME_W, y / S.FRAME_H) for x, y in S.TRAY_POLY], True, 0.8)
+    jittery = EmptyTrayModel.build(frames, tray.bbox(w, h), tray.pixel_points(w, h).tolist(), work=192)
+    bad = jittery.stability()
+    print(f"     hunting exposure: median {bad['median']:.1f}, {100 * bad['fraction_noisy']:.0f}% noisy "
+          f"-> {bad['verdict']}")
+    check("a jittering view is not called good", bad["verdict"] != "good", str(bad))
+    check("and it is noisier than the steady one", bad["median"] > good["median"],
+          f"{bad['median']:.1f} vs {good['median']:.1f}")
+    for key in ("median", "p95", "verdict", "fraction_noisy"):
+        check(f"the report carries {key}", key in bad)
+
+
 def test_no_model_is_off_not_wrong():
     print("\n[6] a resolution change is detected instead of guessed at")
     model, seg = build()
@@ -199,6 +239,7 @@ def main() -> int:
     test_hand_intrusion()
     test_lighting_drift()
     test_timing()
+    test_stability_report()
     test_no_model_is_off_not_wrong()
     test_persistence()
     failed = [c for c in CHECKS if not c[1]]
