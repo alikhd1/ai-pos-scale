@@ -109,7 +109,7 @@ def _run(argv, timeout=30) -> str:
         return f"(could not run {argv[0]}: {exc})"
 
 
-def _add_crash_evidence(z: "zipfile.ZipFile") -> None:
+def _add_crash_evidence(z: "zipfile.ZipFile", wanted: Optional[List[str]] = None) -> None:
     """Bug checks, drivers and crash dumps - the evidence for a blue screen."""
     if not sys.platform.startswith("win"):
         return
@@ -144,11 +144,20 @@ def _add_crash_evidence(z: "zipfile.ZipFile") -> None:
         dumps = []
         notes.append(f"{folder} is not readable by this user - run the app as administrator once "
                      "to collect the dumps.")
+    if wanted:
+        # only names that are really in the folder: nothing from anywhere else
+        keep = {w.lower() for w in wanted}
+        unknown = sorted(keep - {os.path.basename(d).lower() for d in dumps})
+        if unknown:
+            notes.append("asked for but not present: " + ", ".join(unknown))
+        dumps = [d for d in dumps if os.path.basename(d).lower() in keep]
+    cap_files = len(dumps) if wanted else MINIDUMP_MAX_FILES
+    cap_total = 2 * MINIDUMP_TOTAL_BYTES if wanted else MINIDUMP_TOTAL_BYTES
     sent, total = 0, 0
     for path in dumps:
         size = os.path.getsize(path)
         stamp = f"{dt.datetime.fromtimestamp(os.path.getmtime(path)):%Y-%m-%d %H:%M:%S}"
-        if sent >= MINIDUMP_MAX_FILES or size > MINIDUMP_MAX_BYTES or total + size > MINIDUMP_TOTAL_BYTES:
+        if sent >= cap_files or size > MINIDUMP_MAX_BYTES or total + size > cap_total:
             notes.append(f"{os.path.basename(path)}: {size // 1024} KB, {stamp} - listed only, over the size cap")
             continue
         try:
@@ -163,10 +172,17 @@ def _add_crash_evidence(z: "zipfile.ZipFile") -> None:
 
 
 def collect(path: str, frame: Optional[np.ndarray], tray, db, engine, settings,
-            recognition=None, note: str = "") -> str:
-    """Write the bundle and return its path."""
+            recognition=None, note: str = "", minidumps: Optional[List[str]] = None,
+            lean: bool = False) -> str:
+    """Write the bundle and return its path.
+
+    ``lean`` leaves out the camera picture and the crops cut from it - the
+    bulkiest part - so a request for crash dumps has the room to carry them.
+    """
     from ai_engine import MODE_OBJECT, MODE_TRAY, region_crop
 
+    if lean:
+        frame = None
     os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
     seg = None
     if engine is not None and frame is not None:
@@ -266,7 +282,7 @@ def collect(path: str, frame: Optional[np.ndarray], tray, db, engine, settings,
         except Exception as exc:
             z.writestr("camera.txt", f"could not collect camera information: {exc}")
 
-        _add_crash_evidence(z)
+        _add_crash_evidence(z, minidumps)
 
         for name in ("selftest_report.txt", "crash_history.txt"):
             src = os.path.join(os.path.dirname(os.path.abspath(path)), name)

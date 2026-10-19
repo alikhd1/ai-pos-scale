@@ -2470,8 +2470,11 @@ class MainWindow(QMainWindow):
         if name == "diagnostics":
             path = diagnostics.default_path(app_dir())
             _fid, frame = self._camera_frame()
+            wanted = args.get("minidumps")
             diagnostics.collect(path, frame, self.tray, self.db, self.engine, self.settings,
-                                self.current_rec, note="collected remotely")
+                                self.current_rec, note="collected remotely",
+                                minidumps=[str(n) for n in wanted] if isinstance(wanted, list) else None,
+                                lean=bool(args.get("lean", False)))
             with open(path, "rb") as fh:
                 blob = fh.read()
             return {"filename": os.path.basename(path), "bytes": len(blob),
