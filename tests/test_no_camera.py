@@ -120,6 +120,21 @@ try:
     check("and a commit", bool(b.get("commit")), str(b))
     check("it is always a dict, checkout or not", isinstance(b, dict))
 
+    # It used to read .git on every call, so between a pull and the restart the
+    # OLD process reported the NEW commit. That fooled a real remote update:
+    # "new commit, engine loaded" was satisfied by a process about to exit.
+    real_running = dict(A._RUNNING_BUILD)
+    try:
+        A._RUNNING_BUILD["commit"] = "0000000000"          # as if loaded before a pull
+        stale = A.build_id()
+        check("it reports the code that was loaded, not what is on disk",
+              stale["commit"] == "0000000000", str(stale))
+        check("and says newer code is waiting", stale.get("restart_pending") == "yes", str(stale))
+        check("naming the commit on disk", stale.get("on_disk") == real_running.get("commit"), str(stale))
+    finally:
+        A._RUNNING_BUILD.clear(); A._RUNNING_BUILD.update(real_running)
+    check("with nothing pending it says nothing", "restart_pending" not in A.build_id(), str(A.build_id()))
+
     print("\n[6] the backend is chosen for what the camera is asked to do")
     # a real till reported it could not lock exposure or white balance: Media
     # Foundation barely implements camera controls. That matters because a

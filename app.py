@@ -48,14 +48,9 @@ APP_VERSION = "1.4"
 _MISSING = object()
 
 
-def build_id() -> Dict[str, str]:
-    """Which code is actually running, for the support report.
-
-    Read straight out of .git rather than by running git: this is called from
-    a background thread on a till, and spawning a process there to answer a
-    question about ourselves is not worth the risk or the wait.
-    """
-    info = {"version": APP_VERSION, "frozen": str(is_frozen())}
+def _head_on_disk() -> Dict[str, str]:
+    """Branch and commit the checkout is at right now, read from .git."""
+    info: Dict[str, str] = {}
     head = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".git", "HEAD")
     try:
         with open(head, "r", encoding="utf-8") as fh:
@@ -68,6 +63,28 @@ def build_id() -> Dict[str, str]:
             info["commit"] = ref[:10]            # detached head
     except OSError:
         info["commit"] = "unknown (not a git checkout)"
+    return info
+
+
+#: the code this process actually loaded, fixed at import. Reading .git on
+#: every call reported the commit on disk instead, which after a pull and
+#: before the restart is the NEW commit while the OLD code is still running.
+_RUNNING_BUILD = _head_on_disk()
+
+
+def build_id() -> Dict[str, str]:
+    """Which code is actually running, and whether newer code is waiting.
+
+    Read out of .git rather than by running git: this is called from a
+    background thread on a till, and spawning a process there to ask about
+    ourselves is not worth the risk or the wait.
+    """
+    info = {"version": APP_VERSION, "frozen": str(is_frozen())}
+    info.update(_RUNNING_BUILD)
+    disk = _head_on_disk().get("commit")
+    if disk and disk != info.get("commit"):
+        info["on_disk"] = disk
+        info["restart_pending"] = "yes"
     return info
 
 
@@ -2569,8 +2586,12 @@ class MainWindow(QMainWindow):
         that only take effect on a restart, so the caller can say so instead
         of implying the change is already live.
         """
-        if key == "ai.per_object_recognition" and self.engine is not None:
-            self.engine.set_per_object(bool(self.settings.get(key, True)))
+        if key == "ai.per_object_recognition":
+            if self.engine is not None:
+                self.engine.set_per_object(bool(self.settings.get(key, True)))
+            # if the engine is still loading it reads this from the settings
+            # when it is built, so it is in effect either way - not "after a
+            # restart", which is what it used to claim
             return True
         if key.startswith("pos.") or key.startswith("support.") or key == "scale.stable_only":
             # read fresh from settings every time they are used
