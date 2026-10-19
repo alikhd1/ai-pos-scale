@@ -175,7 +175,10 @@ class FrameSplitter:
     protocols that have no terminator at all.  A safety limit flushes over-long
     buffers.
     """
-    TERMINATORS = b"\r\n\x03"
+    # CR, LF, ETX, and the other C0 bytes these indicators wrap readings in:
+    # SOH, EOT, ENQ, ACK and NUL. Without them the bytes between one reading's
+    # trailer and the next one's header pile up into a frame of their own.
+    TERMINATORS = b"\r\n\x03\x00\x01\x04\x05\x06"
     STX = 0x02
     MAX_LEN = 256
 
@@ -263,6 +266,7 @@ class ScaleReader(threading.Thread, BaseScale):
         self.frames_received = 0
         self.readings = 0
         self.parse_failures = 0
+        self.framing_frames = 0          # delimiters, not unreadable data
         self.unstable_readings = 0
         self.last_data_time = 0.0
         self.recent_frames: Deque[Tuple[float, bytes, Optional[WeightReading]]] = deque(maxlen=40)
@@ -307,7 +311,7 @@ class ScaleReader(threading.Thread, BaseScale):
         now = time.time()
         return {"status": self.status, "error": self.last_error, "bytes": self.bytes_received,
                 "frames": self.frames_received, "readings": self.readings, "parse_failures": self.parse_failures,
-                "unstable": self.unstable_readings,
+                "unstable": self.unstable_readings, "framing_frames": self.framing_frames,
                 "data_age": (now - self.last_data_time) if self.last_data_time else None,
                 "unparsed": self.unparsed_samples(),
                 "port": self.config.get("port", ""), "baudrate": self.config.get("baudrate", 9600)}
@@ -390,7 +394,13 @@ class ScaleReader(threading.Thread, BaseScale):
             except Exception:
                 pass
         if reading is None:
-            self.parse_failures += 1
+            # A frame with nothing printable in it is framing, not data we
+            # failed to read, and counting it as a failure makes a healthy
+            # scale look half broken.
+            if not any(32 <= b < 127 for b in frame):
+                self.framing_frames += 1
+            else:
+                self.parse_failures += 1
             return
         self.readings += 1
         if not reading.stable:

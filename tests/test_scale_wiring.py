@@ -29,7 +29,7 @@ os.environ.setdefault("QT_QPA_FONTDIR", r"C:\Windows\Fonts")
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import scale_driver
-from scale_driver import ScaleReader, parse_weight
+from scale_driver import ScaleReader, parse_weight, FrameSplitter
 
 CHECKS = []
 
@@ -195,6 +195,44 @@ def test_mode_matrix():
         finally:
             win.stop_scale()
             win.close()
+
+
+def test_control_byte_framing():
+    """Control bytes around a reading are framing, not unreadable data.
+
+    Taken from a real till, which reported 4500 "parse failures" against 3498
+    readings and looked like a scale half of whose output was gibberish. The
+    rejected frames were 04 00 01, 01 and 04 00 - EOT, NUL and SOH, the
+    delimiters themselves. The splitter ended frames on CR, LF, ETX and STX
+    only, so everything between one reading's trailer and the next one's
+    header became a frame of its own.
+    """
+    print("\n[4e] control bytes between readings are not 'data not understood'")
+    splitter = FrameSplitter()
+    # exactly what that indicator sends, three readings' worth
+    frames = splitter.feed(b"\x02S-01.148kg\x03\x04\x00\x01" * 3)
+    check("one frame per reading, no lumps of control bytes", len(frames) == 3, str(frames))
+    parsed = [parse_weight(f) for f in frames]
+    check("every frame parses", all(p is not None for p in parsed), str(frames))
+    check("and to the right weight", all(abs(p.weight_kg + 1.148) < 1e-9 for p in parsed if p),
+          str([p.weight_kg for p in parsed if p]))
+
+    # belt and braces: even if another indicator's delimiters get through, a
+    # frame with nothing printable in it must not be called a parse failure.
+    # The real reader, just never started - its constructor opens nothing.
+    reader = ScaleReader({"port": "COM-does-not-exist", "baudrate": 9600})
+    for frame in (b"\x04\x00\x01", b"\x01", b"ST,GS,  1.234kg", b"GARBAGE HERE"):
+        reader._handle_frame(frame)
+    check("the control-byte frames counted as framing", reader.framing_frames == 2,
+          f"framing={reader.framing_frames}")
+    check("only the real junk counted as a failure", reader.parse_failures == 1,
+          f"failures={reader.parse_failures}")
+    check("the weight still got through", reader.readings == 1, f"readings={reader.readings}")
+    check("health reports framing separately", reader.health().get("framing_frames") == 2,
+          str(reader.health()))
+    check("framing frames are not offered as unreadable samples",
+          all("1.234" not in u["text"] for u in reader.unparsed_samples()),
+          str(reader.unparsed_samples()))
 
 
 def test_unparsed_samples():
@@ -397,6 +435,7 @@ def main() -> int:
     test_driver_never_drops_a_weight()
     test_reader_reads_a_fake_scale()
     test_mode_matrix()
+    test_control_byte_framing()
     test_unparsed_samples()
     test_hid_support()
     test_reconciliation()
