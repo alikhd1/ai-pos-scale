@@ -59,7 +59,10 @@ PROTOCOL = 1
 MAX_FRAME_WIDTH = 480          # a snapshot is for looking at, not for archiving
 FRAME_QUALITY = 55
 MAX_LOG_LINES = 300
-MAX_BODY_BYTES = 3 * 1024 * 1024
+# under the service's 8 MB, with room for a diagnostic bundle carrying crash dumps
+MAX_BODY_BYTES = 7 * 1024 * 1024
+#: strings longer than this are the first thing dropped from an oversized post
+BULKY_STRING = 100 * 1024
 
 
 # --------------------------------------------------------------------------- #
@@ -86,6 +89,52 @@ ACTIONS = {
 
 class SupportError(Exception):
     pass
+
+
+class TooLarge(SupportError):
+    """The body is over the limit - unlike a network failure, retrying cannot fix it."""
+
+
+def _encoded_size(body: Dict[str, Any]) -> int:
+    return len(json.dumps(body, ensure_ascii=False, default=str).encode("utf-8"))
+
+
+def _drop_bulky(value: Any, dropped: List[str], where: str = "") -> Any:
+    """Replace every long string inside ``value`` with a note saying it was cut."""
+    if isinstance(value, str) and len(value) > BULKY_STRING:
+        dropped.append(f"{where or 'value'} ({len(value) // 1024} KB)")
+        return f"(dropped: {len(value) // 1024} KB, over the upload limit)"
+    if isinstance(value, dict):
+        return {k: _drop_bulky(v, dropped, f"{where}.{k}" if where else k) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_drop_bulky(v, dropped, f"{where}[{i}]") for i, v in enumerate(value)]
+    return value
+
+
+def fit_body(body: Dict[str, Any], limit: int) -> Dict[str, Any]:
+    """Cut a post down until it fits, in order of what matters least.
+
+    Never returns something that cannot be sent: the last resort keeps only
+    each result's name and outcome, which is still enough to know what ran.
+    """
+    if _encoded_size(body) <= limit:
+        return body
+    dropped: List[str] = []
+    body = dict(body)
+    body["results"] = _drop_bulky(body.get("results") or [], dropped, "results")
+    if _encoded_size(body) > limit:
+        snap = dict(body.get("snapshot") or {})
+        for key in ("frame_jpeg_b64", "log_tail"):
+            if snap.pop(key, None) is not None:
+                dropped.append(f"snapshot.{key}")
+        body["snapshot"] = snap
+    if _encoded_size(body) > limit:
+        body["results"] = [{k: r.get(k) for k in ("id", "name", "ok", "error", "took_s", "at")}
+                           for r in (body.get("results") or []) if isinstance(r, dict)]
+        dropped.append("every result's payload")
+    body["dropped_for_size"] = dropped
+    log.warning("support post over %d KB; dropped %s", limit // 1024, ", ".join(dropped))
+    return body
 
 
 _ssl_lock = threading.Lock()
@@ -329,8 +378,8 @@ class RemoteSupport:
     def _post_snapshot(self) -> List[Dict[str, Any]]:
         with self._lock:
             results, self._pending = self._pending, []
-        body = {"protocol": PROTOCOL, "sent_at": time.time(), "machine": machine_identity(),
-                "snapshot": self._snapshot(), "results": results}
+        body = fit_body({"protocol": PROTOCOL, "sent_at": time.time(), "machine": machine_identity(),
+                         "snapshot": self._snapshot(), "results": results}, MAX_BODY_BYTES)
         try:
             reply = self._post("/snapshot", body)
         except Exception:
@@ -345,7 +394,7 @@ class RemoteSupport:
     def _post(self, path: str, body: Dict[str, Any]) -> Dict[str, Any]:
         data = json.dumps(body, ensure_ascii=False, default=str).encode("utf-8")
         if len(data) > MAX_BODY_BYTES:
-            raise SupportError(f"snapshot too large ({len(data) // 1024} KB)")
+            raise TooLarge(f"snapshot too large ({len(data) // 1024} KB)")
         req = urllib.request.Request(self.url + path, data=data, method="POST",
                                      headers={"Content-Type": "application/json",
                                               "Authorization": "Bearer " + self.token,

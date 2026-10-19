@@ -244,7 +244,32 @@ try:
     plain = explain_tls_error(ssl.SSLError("[SSL: WRONG_VERSION_NUMBER] wrong version number"), "https://x/pos")
     check("a plaintext port is explained differently", "without TLS" in plain, plain[:60])
 
-    print("\n[12] helpers")
+    print("\n[12] an oversized result is cut down, it does not silence the till")
+    # A too-big post used to raise, the result went back in the queue "so it is
+    # not lost", and every later attempt carried it and failed again - one big
+    # diagnostic bundle would have cut the till off for good. Retrying is right
+    # for the network dropping and can never work for a body that is too big.
+    import remote_support as RS
+    RECEIVED.clear()
+    channel = RemoteSupport(Settings(url=URL, token="secret-token"), snapshot, run_action)
+    channel._pending = [{"id": "big", "name": "diagnostics", "ok": True,
+                         "result": {"filename": "bundle.zip", "zip_b64": "A" * (RS.MAX_BODY_BYTES + 1024)}}]
+    channel._post_snapshot()
+    check("the post went through", len(RECEIVED) == 1, str(len(RECEIVED)))
+    sent = RECEIVED[-1] if RECEIVED else {}
+    r = (sent.get("results") or [{}])[0]
+    check("the result still arrived, minus its payload", r.get("id") == "big" and r.get("ok") is True, str(r)[:200])
+    check("and it says what was cut", "dropped" in str((r.get("result") or {}).get("zip_b64", "")),
+          str(r)[:200])
+    check("the post records what it dropped", bool(sent.get("dropped_for_size")), str(sent.get("dropped_for_size")))
+    check("nothing is left queued to wedge the next attempt", channel._pending == [], str(channel._pending)[:120])
+    channel._post_snapshot()
+    check("and the next report goes through as normal", len(RECEIVED) == 2, str(len(RECEIVED)))
+
+    small = {"results": [{"id": "s", "result": {"x": "y"}}], "snapshot": {"a": 1}}
+    check("something small is left exactly as it was", RS.fit_body(small, RS.MAX_BODY_BYTES) is small)
+
+    print("\n[13] helpers")
     import numpy as np
     frame = (np.random.default_rng(1).random((480, 640, 3)) * 255).astype(np.uint8)
     b64 = encode_frame(frame)
@@ -258,7 +283,11 @@ except Exception:
 finally:
     server.shutdown()
 
-print("\n" + ("ALL CHECKS PASSED" if ok["all"] else f"{len(FAILED)} CHECK(S) FAILED"))
+# a crash before any check failed used to print "0 CHECK(S) FAILED", which
+# reads like a pass
+print("\n" + ("ALL CHECKS PASSED" if ok["all"] else
+              (f"{len(FAILED)} CHECK(S) FAILED" if FAILED else
+               "CRASHED - the run stopped part way; see the traceback above")))
 for name, detail in FAILED:
     print(f"  - {name} {detail}")
 sys.exit(0 if ok["all"] else 1)

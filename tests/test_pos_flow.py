@@ -327,6 +327,16 @@ try:
     res_p = win.support_action("set_setting", {"key": "ai.per_object_recognition", "value": False})
     check("single-item mode reaches the running engine", win.engine.per_object is False,
           str(win.engine.per_object))
+    # the empty-tray path labelled its result "object" whenever a segmenter
+    # existed, so a till in single-item mode kept reporting object mode
+    # the scale, not the camera, decides "empty": that path only runs when the
+    # weight says so, so empty the scale as well as the picture
+    cam.set([])
+    win.sim_spin.setValue(0.0)
+    wait(lambda: win.current_rec is not None and win.current_rec.empty, 30, "tray reads empty")
+    check("an empty tray in single-item mode is labelled tray, not object",
+          win.current_rec is not None and win.current_rec.mode == "tray",
+          str(getattr(win.current_rec, "mode", None)))
     check("and the reply says it is live", res_p.get("applied_live") is True, str(res_p))
     win.support_action("set_setting", {"key": "ai.per_object_recognition", "value": True})
     check("and back again", win.engine.per_object is True, str(win.engine.per_object))

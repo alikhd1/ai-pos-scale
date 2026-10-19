@@ -1379,7 +1379,10 @@ class RecognitionEngine(threading.Thread):
             rec = Recognition([], tray_bbox, True, weight_empty, 0.0,
                               bool(seg and seg.intrusion), bool(seg and seg.unreliable),
                               seg is not None, self.seg_ms, (time.time() - t0) * 1000.0,
-                              MODE_OBJECT if seg is not None else MODE_TRAY)
+                              # per_object too, as the item path below does: an
+                              # empty tray in single-item mode used to report
+                              # "object" because a segmenter merely existed
+                              MODE_OBJECT if (seg is not None and self.per_object) else MODE_TRAY)
             return rec
 
         object_gallery = self.db.gallery(MODE_OBJECT)["centroids"] is not None

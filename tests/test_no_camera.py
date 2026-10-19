@@ -162,7 +162,11 @@ except Exception:
     ok["all"] = False
     traceback.print_exc()
 
-print("\n" + ("ALL CHECKS PASSED" if ok["all"] else f"{len(FAILED)} CHECK(S) FAILED"))
+# a crash before any check failed used to print "0 CHECK(S) FAILED", which
+# reads like a pass
+print("\n" + ("ALL CHECKS PASSED" if ok["all"] else
+              (f"{len(FAILED)} CHECK(S) FAILED" if FAILED else
+               "CRASHED - the run stopped part way; see the traceback above")))
 for name, detail in FAILED:
     print(f"  - {name} {detail}")
 sys.exit(0 if ok["all"] else 1)

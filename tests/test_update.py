@@ -194,7 +194,7 @@ elif FAILED:
 else:
     # a crash before the first check used to print "0 CHECK(S) FAILED",
     # which reads like a pass
-    print("\nFAILED before any check ran - see the traceback above")
+    print("\nCRASHED - the run stopped part way; see the traceback above")
 for name, detail in FAILED:
     print(f"  - {name} {detail}")
 sys.exit(0 if ok["all"] else 1)

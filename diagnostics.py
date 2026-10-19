@@ -20,6 +20,10 @@ particular produce, is the whole problem.  This module packages that evidence:
     config.json          the settings (no secrets are stored in it)
     camera.txt           what the camera layer tried and what Windows can see
     selftest_report.txt  the last self-test, if there is one
+    windows_crashes.txt  the System log's bug-check and shutdown events
+    drivers.txt          the third-party drivers installed (pnputil)
+    minidump/*.dmp       the latest small crash dumps, size-capped
+    dumps.txt            which dumps exist, and why any were left out
     aipos.log            the tail of the log
 
 Nothing here leaves the machine on its own: it writes a file the operator can
@@ -83,6 +87,79 @@ def _draw_overlay(frame: np.ndarray, tray, seg) -> np.ndarray:
         if seg.unreliable:
             cv2.putText(out, "UNRELIABLE", (10, h - 36), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (60, 180, 240), 2, cv2.LINE_AA)
     return out
+
+
+#: crash dumps are capped so the bundle still fits through the support channel
+MINIDUMP_MAX_FILES = 3
+MINIDUMP_MAX_BYTES = 1_500_000
+MINIDUMP_TOTAL_BYTES = 3_000_000
+CRASH_EVENT_IDS = (41, 1001, 6008, 1074)
+
+
+def _run(argv, timeout=30) -> str:
+    """Run a read-only system query and return its text, or why it failed."""
+    import subprocess
+    try:
+        done = subprocess.run(argv, capture_output=True, text=True, timeout=timeout,
+                              errors="replace",
+                              creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        out = (done.stdout or "") + (("\n" + done.stderr) if done.stderr.strip() else "")
+        return out.strip() or f"(no output, exit code {done.returncode})"
+    except Exception as exc:
+        return f"(could not run {argv[0]}: {exc})"
+
+
+def _add_crash_evidence(z: "zipfile.ZipFile") -> None:
+    """Bug checks, drivers and crash dumps - the evidence for a blue screen."""
+    if not sys.platform.startswith("win"):
+        return
+    query = "*[System[(" + " or ".join(f"EventID={i}" for i in CRASH_EVENT_IDS) + ")]]"
+    z.writestr("windows_crashes.txt",
+               "# bug checks (1001), power loss (41), unexpected shutdown (6008), requested\n"
+               "# restart (1074) - newest first. NB: on a machine whose time zone is wrong the\n"
+               "# 'Z' times are local wall-clock, not UTC.\n\n"
+               + _run(["wevtutil", "qe", "System", f"/q:{query}", "/c:20", "/rd:true", "/f:text"]))
+    z.writestr("drivers.txt",
+               "# third-party drivers. A user-mode program cannot cause a bug check, so after\n"
+               "# the hardware these are the only suspects.\n\n"
+               + _run(["pnputil", "/enum-drivers"]))
+
+    notes: List[str] = []
+    windir = os.environ.get("SystemRoot", r"C:\Windows")
+    full = os.path.join(windir, "MEMORY.DMP")
+    if os.path.isfile(full):
+        st = os.stat(full)
+        notes.append(f"{full}: {st.st_size / 1e6:.0f} MB, written "
+                     f"{dt.datetime.fromtimestamp(st.st_mtime):%Y-%m-%d %H:%M:%S} - too large to send; "
+                     f"it holds only the most recent crash")
+    folder = os.path.join(windir, "Minidump")
+    try:
+        dumps = sorted((os.path.join(folder, n) for n in os.listdir(folder) if n.lower().endswith(".dmp")),
+                       key=os.path.getmtime, reverse=True)
+    except FileNotFoundError:
+        dumps = []
+        notes.append(f"{folder} does not exist: Windows is set to write only the full dump. "
+                     "Startup and Recovery > 'Small memory dump' would keep one per crash.")
+    except PermissionError:
+        dumps = []
+        notes.append(f"{folder} is not readable by this user - run the app as administrator once "
+                     "to collect the dumps.")
+    sent, total = 0, 0
+    for path in dumps:
+        size = os.path.getsize(path)
+        stamp = f"{dt.datetime.fromtimestamp(os.path.getmtime(path)):%Y-%m-%d %H:%M:%S}"
+        if sent >= MINIDUMP_MAX_FILES or size > MINIDUMP_MAX_BYTES or total + size > MINIDUMP_TOTAL_BYTES:
+            notes.append(f"{os.path.basename(path)}: {size // 1024} KB, {stamp} - listed only, over the size cap")
+            continue
+        try:
+            z.write(path, "minidump/" + os.path.basename(path))
+            sent, total = sent + 1, total + size
+            notes.append(f"{os.path.basename(path)}: {size // 1024} KB, {stamp} - included")
+        except OSError as exc:
+            notes.append(f"{os.path.basename(path)}: could not be read ({exc})")
+    if not dumps and not any("does not exist" in n or "not readable" in n for n in notes):
+        notes.append(f"{folder} is empty")
+    z.writestr("dumps.txt", "\n".join(notes) + "\n")
 
 
 def collect(path: str, frame: Optional[np.ndarray], tray, db, engine, settings,
@@ -188,6 +265,8 @@ def collect(path: str, frame: Optional[np.ndarray], tray, db, engine, settings,
             z.writestr("camera.txt", "\n".join(cam_lines))
         except Exception as exc:
             z.writestr("camera.txt", f"could not collect camera information: {exc}")
+
+        _add_crash_evidence(z)
 
         for name in ("selftest_report.txt", "crash_history.txt"):
             src = os.path.join(os.path.dirname(os.path.abspath(path)), name)

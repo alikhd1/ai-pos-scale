@@ -113,7 +113,7 @@ finally:
     shutil.rmtree(TMP, ignore_errors=True)
 
 print("\n" + ("ALL CHECKS PASSED" if ok["all"] else
-              (f"{len(FAILED)} CHECK(S) FAILED" if FAILED else "FAILED before any check ran")))
+              (f"{len(FAILED)} CHECK(S) FAILED" if FAILED else "CRASHED - the run stopped part way; see the traceback above")))
 for name, detail in FAILED:
     print(f"  - {name} {detail}")
 sys.exit(0 if ok["all"] else 1)
