@@ -3440,7 +3440,9 @@ class MainWindow(QMainWindow):
         # the operator to discover that nothing works. Measure it and say so.
         self._bg_stability = model.stability()
         log.info("empty-tray stability: %s", self._bg_stability)
-        if self._bg_stability["verdict"] == "unusable":
+        if self._bg_stability.get("reason") == "overexposed":
+            msg_error(self, tr("tray_overexposed", percent=100.0 * self._bg_stability["saturated"]))
+        elif self._bg_stability["verdict"] == "unusable":
             msg_error(self, tr("tray_unstable", median=self._bg_stability["median"],
                                percent=100.0 * self._bg_stability["fraction_noisy"]))
         elif self._bg_stability["verdict"] == "marginal":

@@ -224,13 +224,26 @@ class EmptyTrayModel:
         inside = self.sigma[self.idx] if self.tray_area_work else self.sigma.reshape(-1)
         median = float(np.median(inside)) if inside.size else 0.0
         p95 = float(np.percentile(inside, 95)) if inside.size else 0.0
-        if median <= 8.0:
+        # A clipped pixel reads the same whatever happens, so it has no noise:
+        # a blown-out tray LOOKS perfectly steady while carrying nothing at all.
+        # Measured on a real till: 99.7% clipped, median noise 2.5 on those
+        # pixels against 13 on the rest. Count the clipping and let it decide.
+        bg = self.bg[self.idx] if self.tray_area_work else self.bg.reshape(-1, 3)
+        saturated = float((bg.max(axis=1) >= 250).mean()) if bg.size else 0.0
+        crushed = float((bg.max(axis=1) <= 8).mean()) if bg.size else 0.0
+        reason = ""
+        if saturated > 0.20:
+            verdict, reason = "unusable", "overexposed"
+        elif crushed > 0.20:
+            verdict, reason = "unusable", "underexposed"
+        elif median <= 8.0:
             verdict = "good"
         elif median <= 16.0:
             verdict = "marginal"
         else:
-            verdict = "unusable"
-        return {"median": median, "p95": p95, "verdict": verdict,
+            verdict, reason = "unusable", "unsteady"
+        return {"median": median, "p95": p95, "verdict": verdict, "reason": reason,
+                "saturated": saturated, "crushed": crushed,
                 "fraction_noisy": float((inside > 16.0).mean()) if inside.size else 0.0}
 
     # ---- persistence -------------------------------------------------------

@@ -298,6 +298,14 @@ STRINGS = {
                         "برنامه از قبل روی این کامپیوتر در حال اجراست.\n\nاز همان پنجره‌ای که باز است "
                         "استفاده کنید. دو نسخه هم‌زمان سر دوربین با هم تداخل می‌کنند و ممکن است به "
                         "دیتابیس کالاها آسیب بزنند."),
+    "tray_overexposed": ("The tray is too bright for the camera: {percent:.0f}% of it is pure white, "
+                         "so it cannot see anything change there. This camera does not let its "
+                         "exposure be fixed, so the tray has to be darker - use a grey or brown matte "
+                         "sheet instead of white paper, or reduce the light - and capture again.",
+                         "سینی برای دوربین بیش از حد روشن است: {percent:.0f}٪ آن سفیدِ کامل است و "
+                         "دوربین هیچ تغییری را آنجا نمی‌بیند. نوردهی این دوربین قابل قفل شدن نیست، "
+                         "پس سینی باید تیره‌تر باشد — به‌جای کاغذ سفید از یک ورق مات خاکستری یا قهوه‌ای "
+                         "استفاده کنید، یا نور را کم کنید — و دوباره ثبت کنید."),
     "tray_settling": ("Waiting for the view to be still - take your hands away from the tray",
                       "در انتظار ثابت شدن تصویر — دست‌ها را از روی سینی بردارید"),
     "tray_settle_timeout": ("The view never settled, so the empty tray was captured anyway. If "

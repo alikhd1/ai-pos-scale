@@ -252,8 +252,23 @@ def test_stability_report():
     check("a jittering view is not called good", bad["verdict"] != "good", str(bad))
     check("and it is noisier than the steady one", bad["median"] > good["median"],
           f"{bad['median']:.1f} vs {good['median']:.1f}")
-    for key in ("median", "p95", "verdict", "fraction_noisy"):
+    for key in ("median", "p95", "verdict", "fraction_noisy", "saturated", "reason"):
         check(f"the report carries {key}", key in bad)
+
+    # The trap a real till fell into, and I with it: its reference scored the
+    # lowest noise yet and was called good. It was 99.7% clipped white. A
+    # clipped pixel reads 255 whatever happens, so it has no variance, and a
+    # picture with no information in it looks perfectly steady.
+    blown = [np.clip(S.scene([], seed=i).astype(np.float32) * 3.0 + 120, 0, 255).astype(np.uint8)
+             for i in range(6)]
+    hb, wb = blown[0].shape[:2]
+    over = EmptyTrayModel.build(blown, tray.bbox(wb, hb), tray.pixel_points(wb, hb).tolist(), work=192)
+    rep = over.stability()
+    print(f"     blown-out view: median {rep['median']:.1f}, {100 * rep['saturated']:.0f}% clipped "
+          f"-> {rep['verdict']} ({rep['reason']})")
+    check("a blown-out view is NOT called good, however steady it looks", rep["verdict"] != "good", str(rep))
+    check("it is named as overexposed", rep["reason"] == "overexposed", str(rep))
+    check("even though its noise really is low", rep["median"] < 8.0, f"{rep['median']:.1f}")
 
 
 def test_no_model_is_off_not_wrong():
