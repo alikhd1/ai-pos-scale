@@ -3313,7 +3313,45 @@ class MainWindow(QMainWindow):
         if not ask(self, tr("empty_tray_confirm")):
             return
         self._bg_frames = []
-        self._grab_bg_frame(0)
+        self._settle_prev = None
+        self._settle_still = 0
+        self._wait_until_still(0)
+
+    #: consecutive quiet looks before the capture starts, and how quiet counts
+    SETTLE_NEEDED = 4
+    SETTLE_MOTION = 2.5
+    SETTLE_GIVE_UP = 60            # x 100 ms
+
+    def _wait_until_still(self, attempt: int):
+        """Hold off until the picture stops changing.
+
+        The operator has just taken their hands off the tray, and those hands
+        take a moment to leave the frame. Averaging them into the reference
+        quietly ruins it, and the damage only shows up later as recognition
+        that will not work.
+        """
+        if not self._bg_wanted and self._bg_frames:
+            return                                   # cancelled
+        _fid, frame = self._camera_frame()
+        if frame is not None:
+            small = cv2.resize(frame, (96, 72), interpolation=cv2.INTER_AREA).astype(np.float32)
+            if self._settle_prev is not None:
+                motion = float(np.abs(small - self._settle_prev).mean())
+                self._settle_still = self._settle_still + 1 if motion < self.SETTLE_MOTION else 0
+            self._settle_prev = small
+        if self._settle_still >= self.SETTLE_NEEDED:
+            self.status.clearMessage()
+            self._grab_bg_frame(0)
+            return
+        if attempt >= self.SETTLE_GIVE_UP:
+            # better a reference with a note than no reference at all
+            log.warning("the view never settled; capturing the empty tray anyway")
+            self.status.clearMessage()
+            msg_info(self, tr("tray_settle_timeout"))
+            self._grab_bg_frame(0)
+            return
+        self.status.showMessage(tr("tray_settling"))
+        QTimer.singleShot(100, lambda: self._wait_until_still(attempt + 1))
 
     def _grab_bg_frame(self, attempt: int):
         _, frame = self._camera_frame()

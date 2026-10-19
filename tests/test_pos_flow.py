@@ -240,6 +240,66 @@ try:
     print("\n[7] object outlines are drawn")
     check("mask outlines are on by default", win.video.show_masks)
 
+    print("\n[8] the empty tray is not captured while something is still moving")
+    # a real till produced an unusable reference: noise of 33 where a steady
+    # view reads under 8, a quarter of the tray pinned at the top of the scale,
+    # all of it where a withdrawing arm would be. The capture began the moment
+    # the operator confirmed and then took three seconds of frames, so their
+    # own hand went into the reference and nothing said so.
+    base = S.scene([], seed=40)
+    handed_over = {"at": None}
+    t_start = time.time()
+    real_grab = win._grab_bg_frame
+    def _handover(attempt):
+        handed_over["at"] = moving["n"]
+        handed_over["after"] = time.time() - t_start
+    win._grab_bg_frame = _handover
+
+    moving = {"n": 0}
+
+    def withdrawing_hand():
+        moving["n"] += 1
+        if moving["n"] <= 5:                       # an arm still leaving the frame
+            f = base.copy()
+            f[160:320, 40 + moving["n"] * 25:130 + moving["n"] * 25] = 20
+            return (moving["n"], f)
+        return (moving["n"], base)                 # finally still
+
+    win._camera_frame = withdrawing_hand
+    win._bg_frames, win._settle_prev, win._settle_still = [], None, 0
+    t_start = time.time()
+    win._wait_until_still(0)
+    pump(2.5)
+    check("it did not capture while the hand was moving", handed_over["at"] is not None
+          and handed_over["at"] > 5, f"handed over after frame {handed_over['at']}")
+    # the frame counter also ticks for the on-screen refresh, so it cannot
+    # measure how long the settle waited; elapsed time can
+    waited = handed_over.get("after", 0.0)
+    check("and it did not wait longer than it had to", 0.0 < waited < 2.0, f"{waited:.2f}s")
+
+    # something that never stops moving must not hang the till for ever
+    handed_over["at"] = None
+    forever = {"n": 0}
+
+    def never_still():
+        forever["n"] += 1
+        f = base.copy()
+        x = (forever["n"] * 37) % 400
+        f[160:320, x:x + 90] = 20
+        return (forever["n"], f)
+
+    win._camera_frame = never_still
+    win._bg_frames, win._settle_prev, win._settle_still = [], None, 0
+    win._wait_until_still(win.SETTLE_GIVE_UP - 2)
+    pump(1.5)
+    check("it gives up instead of waiting for ever", handed_over["at"] is not None,
+          "never handed over to the capture")
+    check("and it said the view never settled",
+          any("settle" in t or "ثابت" in t for _k, t in messages[-4:]), str(messages[-4:]))
+
+    win._grab_bg_frame = real_grab
+    win._camera_frame = cam.get
+
     print("\n[8] the remote support snapshot describes this till")
     # a till nobody can walk up to is debugged from this dict alone, so it has
     # to carry the state a person would otherwise have to ask about

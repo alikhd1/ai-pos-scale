@@ -292,6 +292,13 @@ STRINGS = {
                      "تا وقتی آدرس و کلید را وارد نکنید هیچ چیزی ارسال نمی‌شود. صندوق فقط ارسال می‌کند و "
                      "هرگز پورتی باز نمی‌کند، و سرویس فقط می‌تواند همان فهرست ثابت کارهای پشتیبانی را "
                      "درخواست کند — امکان اجرای دستور روی این کامپیوتر وجود ندارد."),
+    "tray_settling": ("Waiting for the view to be still - take your hands away from the tray",
+                      "در انتظار ثابت شدن تصویر — دست‌ها را از روی سینی بردارید"),
+    "tray_settle_timeout": ("The view never settled, so the empty tray was captured anyway. If "
+                            "detection misbehaves, make sure nothing is moving in front of the "
+                            "camera and capture it again.",
+                            "تصویر ثابت نشد و سینی خالی به‌هرحال ثبت شد. اگر تشخیص درست کار نکرد، "
+                            "مطمئن شوید چیزی جلوی دوربین حرکت نمی‌کند و دوباره ثبت کنید."),
     "tray_unstable": ("This view is not steady enough to detect anything reliably "
                       "(noise {median:.0f}, {percent:.0f}% of the tray). The usual cause is a shiny or "
                       "curved surface whose reflections move, or a camera that keeps changing its own "
