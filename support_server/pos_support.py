@@ -58,7 +58,8 @@ MAX_BODY = 8 * 1024 * 1024
 
 #: the only actions a till will accept; kept in step with remote_support.ACTIONS
 ACTIONS = ["ping", "snapshot", "selftest", "find_camera", "find_scale", "restart_camera",
-           "restart_scale", "diagnostics", "logs", "get_setting", "set_setting", "screenshot"]
+           "restart_scale", "diagnostics", "logs", "get_setting", "set_setting", "screenshot",
+           "update"]
 
 SAFE_NAME = re.compile(r"[^A-Za-z0-9._-]")
 

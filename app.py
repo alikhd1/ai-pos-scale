@@ -48,6 +48,29 @@ APP_VERSION = "1.4"
 _MISSING = object()
 
 
+def build_id() -> Dict[str, str]:
+    """Which code is actually running, for the support report.
+
+    Read straight out of .git rather than by running git: this is called from
+    a background thread on a till, and spawning a process there to answer a
+    question about ourselves is not worth the risk or the wait.
+    """
+    info = {"version": APP_VERSION, "frozen": str(is_frozen())}
+    head = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".git", "HEAD")
+    try:
+        with open(head, "r", encoding="utf-8") as fh:
+            ref = fh.read().strip()
+        if ref.startswith("ref:"):
+            info["branch"] = ref.split("/")[-1]
+            with open(os.path.join(os.path.dirname(head), ref[5:].strip()), "r", encoding="utf-8") as fh:
+                info["commit"] = fh.read().strip()[:10]
+        else:
+            info["commit"] = ref[:10]            # detached head
+    except OSError:
+        info["commit"] = "unknown (not a git checkout)"
+    return info
+
+
 # --------------------------------------------------------------------------- #
 # Logging
 # --------------------------------------------------------------------------- #
@@ -192,6 +215,7 @@ def run_selftest(settings: SettingsManager, video_file: str = "") -> int:
     from tray_segment import TraySegmenter
 
     lines: List[str] = [f"AI POS Scale self-test  {dt.datetime.now():%Y-%m-%d %H:%M:%S}",
+                        f"build: {build_id()}",
                         f"frozen={is_frozen()}  app_dir={app_dir()}", f"config={settings.path}", ""]
     ok = True
 
@@ -2281,6 +2305,7 @@ class MainWindow(QMainWindow):
         rec = self.current_rec
         snap = {
             "at": dt.datetime.now().isoformat(timespec="seconds"),
+            "build": build_id(),
             "camera": {
                 "ok": self.camera_ok,
                 "backend": getattr(cam_res, "backend", None),
@@ -2398,7 +2423,85 @@ class MainWindow(QMainWindow):
                     "note": "a restart may be needed for this to take effect"}
         if name == "screenshot":
             return {"png_b64": self._on_ui(self._grab_window_png)}
+        if name == "update":
+            return self._update_from_git(restart=bool(args.get("restart", False)))
         raise ValueError(f"unsupported action: {name!r}")
+
+    def _update_from_git(self, restart: bool = False) -> dict:
+        """Fast-forward this checkout, refuse anything that will not compile.
+
+        A till that does not come back up cannot be fixed from here, so the
+        new code is compiled before it is allowed to run and the checkout is
+        reset if it does not. That covers a bad merge or a half-pushed change;
+        it cannot cover code that compiles and then misbehaves, and nothing
+        short of a second machine could.
+        """
+        folder = os.path.dirname(os.path.abspath(__file__))
+        if not os.path.isdir(os.path.join(folder, ".git")):
+            raise RuntimeError(f"{folder} is not a git checkout, so there is nothing to pull")
+
+        def git(*argv, timeout=120):
+            done = subprocess.run(("git",) + argv, cwd=folder, capture_output=True, text=True,
+                                  timeout=timeout, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            return done.returncode, (done.stdout + done.stderr).strip()
+
+        _rc, before = git("rev-parse", "HEAD")
+        rc, output = git("pull", "--ff-only")
+        _rc, after = git("rev-parse", "HEAD")
+        result = {"before": before[:10], "after": after[:10], "pull": output[-1500:],
+                  "changed": before != after}
+        if rc != 0:
+            # --ff-only refuses a diverged or dirty checkout rather than guessing
+            result["ok"] = False
+            result["error"] = "git pull failed; the checkout was left alone"
+            return result
+
+        bad = self._files_that_do_not_compile(folder)
+        if bad:
+            git("reset", "--hard", before)
+            result.update(ok=False, rolled_back_to=before[:10], does_not_compile=bad,
+                          error="the new code does not compile, so it was rolled back")
+            log.error("update rolled back: %s", bad)
+            return result
+
+        result["ok"] = True
+        result["restarting"] = bool(restart and before != after)
+        if result["restarting"]:
+            log.warning("restarting into %s on request", after[:10])
+            QTimer.singleShot(1500, self._relaunch)
+        return result
+
+    @staticmethod
+    def _files_that_do_not_compile(folder: str) -> List[str]:
+        """Which .py files in ``folder`` will not even parse.
+
+        compile() on the source rather than py_compile: writing byte-code needs
+        somewhere to put it, and py_compile(cfile=os.devnull) fails outright on
+        Windows - which would have marked every file broken and rolled back
+        every update, the exact opposite of the intent.
+        """
+        bad = []
+        for name in sorted(os.listdir(folder)):
+            if not name.endswith(".py"):
+                continue
+            path = os.path.join(folder, name)
+            try:
+                with open(path, "rb") as fh:
+                    compile(fh.read(), path, "exec")
+            except Exception as exc:
+                bad.append(f"{name}: {exc}")
+        return bad
+
+    def _relaunch(self):
+        """Start a fresh copy of ourselves and close this one."""
+        try:
+            argv = [sys.executable] + ([] if is_frozen() else [os.path.abspath(__file__)]) + sys.argv[1:]
+            subprocess.Popen(argv, cwd=os.path.dirname(os.path.abspath(__file__)),
+                             creationflags=getattr(subprocess, "DETACHED_PROCESS", 0))
+        except Exception:
+            log.exception("could not relaunch after update")
+            return
+        self.close()
 
     def _grab_window_png(self) -> str:
         buf = QBuffer()

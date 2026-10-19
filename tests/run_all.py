@@ -15,7 +15,7 @@ import sys
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-SUITES = ["test_scale_wiring.py", "test_no_camera.py", "test_support.py", "test_support_server.py",
+SUITES = ["test_scale_wiring.py", "test_no_camera.py", "test_support.py", "test_support_server.py", "test_update.py",
           "test_segment.py", "test_matcher.py", "test_pos_flow.py"]
 
 

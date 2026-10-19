@@ -80,6 +80,7 @@ ACTIONS = {
     "get_setting":    "read one setting",
     "set_setting":    "change one setting (key must already exist)",
     "screenshot":     "send a picture of the application window",
+    "update":         "git pull this checkout, verify it compiles, and optionally restart",
 }
 
 

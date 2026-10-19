@@ -111,7 +111,16 @@ try:
     check("and it reached the settings", int(win.settings.get("ai.top_k")) == 5,
           str(win.settings.get("ai.top_k")))
 
-    print("\n[5] the camera search gives up quickly when there is nothing there")
+    print("\n[5] the report says which code produced it")
+    # a till was updated, restarted, and still reported without two new
+    # fields; working out that the checkout was stale cost a round trip
+    b = A.build_id()
+    check("the snapshot carries a build", isinstance(win.support_snapshot().get("build"), dict))
+    check("it names a version", b.get("version") == A.APP_VERSION, str(b))
+    check("and a commit", bool(b.get("commit")), str(b))
+    check("it is always a dict, checkout or not", isinstance(b, dict))
+
+    print("\n[6] the camera search gives up quickly when there is nothing there")
     import time
     t0 = time.time()
     try:
