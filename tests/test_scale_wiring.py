@@ -22,6 +22,7 @@ import os
 import sys
 import tempfile
 import time
+from collections import deque
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ.setdefault("QT_QPA_FONTDIR", r"C:\Windows\Fonts")
@@ -196,6 +197,35 @@ def test_mode_matrix():
             win.close()
 
 
+def test_unparsed_samples():
+    """A failure count nobody can act on is not a diagnosis.
+
+    A real till reported 4500 unparseable frames against 3498 good readings,
+    and that number was the whole of what came back - the reader was already
+    keeping the frames, health() just dropped them. Guessing at a protocol
+    from a count is how you fix the wrong thing.
+    """
+    print("\n[4d] frames the parser rejects are kept, not just counted")
+    reader = ScaleReader.__new__(ScaleReader)           # no port, no thread
+    reader.recent_frames = deque(maxlen=40)
+    good = parse_weight(b"ST,GS,  1.234kg")
+    reader.recent_frames.append((time.time(), b"ST,GS,  1.234kg", good))
+    for junk in (b"\x01\x7f", b"CHECKSUM ERR", b"\x01\x7f", b"----"):
+        reader.recent_frames.append((time.time(), junk, None))
+
+    samples = reader.unparsed_samples()
+    texts = [x["text"] for x in samples]
+    check("only the rejected frames are returned", all("1.234" not in t for t in texts), str(texts))
+    check("the junk is there", any("CHECKSUM" in t for t in texts), str(texts))
+    check("duplicates are collapsed", len(texts) == len(set(texts)), str(texts))
+    check("each sample carries hex too", all(x.get("hex") for x in samples), str(samples))
+    check("newest first", "----" in texts[0], str(texts))
+    check("it is bounded", len(reader.unparsed_samples(limit=2)) == 2)
+
+    reader.recent_frames = deque(maxlen=40)
+    check("nothing to report when all is well", reader.unparsed_samples() == [])
+
+
 def test_hid_support():
     print("\n[4b] USB HID scales")
     from hid_scale import parse_hid_report, list_hid_devices, list_hid_scales
@@ -367,6 +397,7 @@ def main() -> int:
     test_driver_never_drops_a_weight()
     test_reader_reads_a_fake_scale()
     test_mode_matrix()
+    test_unparsed_samples()
     test_hid_support()
     test_reconciliation()
     test_weight_gate_and_status()

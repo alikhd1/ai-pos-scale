@@ -282,12 +282,34 @@ class ScaleReader(threading.Thread, BaseScale):
         with self._lock:
             return self._latest
 
+    def unparsed_samples(self, limit: int = 4) -> List[Dict[str, str]]:
+        """A few frames the parser rejected, as text and as hex.
+
+        A bare failure count cannot be acted on from anywhere but the shop
+        floor. These are what turn "data not understood" into a protocol you
+        can actually read.
+        """
+        out: List[Dict[str, str]] = []
+        seen = set()
+        for _t, frame, reading in reversed(self.recent_frames):
+            if reading is not None:
+                continue
+            key = bytes(frame)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append({"text": printable(key)[:80], "hex": key[:40].hex(" ")})
+            if len(out) >= limit:
+                break
+        return out
+
     def health(self) -> Dict:
         now = time.time()
         return {"status": self.status, "error": self.last_error, "bytes": self.bytes_received,
                 "frames": self.frames_received, "readings": self.readings, "parse_failures": self.parse_failures,
                 "unstable": self.unstable_readings,
                 "data_age": (now - self.last_data_time) if self.last_data_time else None,
+                "unparsed": self.unparsed_samples(),
                 "port": self.config.get("port", ""), "baudrate": self.config.get("baudrate", 9600)}
 
     def stop(self, timeout: float = 2.0) -> None:
