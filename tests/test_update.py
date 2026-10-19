@@ -149,7 +149,24 @@ try:
     res = run(till, restart=True)
     check("an update with nothing to pull does not restart", res.get("restarting") is False, str(res))
 
-    print("\n[4] somewhere that is not a checkout is refused")
+    print("\n[4] a broken ORIG_HEAD is cleared instead of blocking the update")
+    # a real till fetched the new commit and then stopped on
+    #   fatal: update_ref failed for ref 'ORIG_HEAD': ... reference broken
+    # ORIG_HEAD is a pointer git rewrites on every pull, so it carries nothing
+    # worth keeping - but git will not pull past it, and that shop had no other
+    # way in, which is exactly what this action exists to prevent.
+    push(up, "VALUE = 4\n", "four")
+    with open(os.path.join(till, ".git", "ORIG_HEAD"), "w") as fh:
+        fh.write("not a sha at all\n")
+    res = run(till)
+    check("the update still went through", res.get("ok") is True, str(res.get("error")))
+    check("it moved on", res.get("changed") is True, str(res))
+    check("and it said what it cleared", "ORIG_HEAD" in res.get("pull", ""),
+          res.get("pull", "")[:200])
+    with open(os.path.join(till, "thing.py")) as fh:
+        check("the new code really landed", "VALUE = 4" in fh.read())
+
+    print("\n[5] somewhere that is not a checkout is refused")
     plain = os.path.join(TMP, "plain")
     os.makedirs(plain)
     try:
@@ -158,7 +175,7 @@ try:
     except RuntimeError as exc:
         check("it refuses a non-checkout", "not a git checkout" in str(exc), str(exc))
 
-    print("\n[5] the compile check itself")
+    print("\n[6] the compile check itself")
     check("a clean folder reports nothing", compiles(os.path.dirname(os.path.abspath(A.__file__))) == [])
     with open(os.path.join(plain, "bad.py"), "w") as fh:
         fh.write("def nope(:\n")

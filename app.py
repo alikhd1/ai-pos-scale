@@ -2495,6 +2495,16 @@ class MainWindow(QMainWindow):
 
         _rc, before = git("rev-parse", "HEAD")
         rc, output = git("pull", "--ff-only")
+        if rc != 0 and "ORIG_HEAD" in output and ("reference broken" in output or "cannot lock ref" in output):
+            # a pointer git rewrites on every pull: worthless, and in the way
+            stale = os.path.join(folder, ".git", "ORIG_HEAD")
+            try:
+                os.remove(stale)
+                log.warning("removed a broken %s and retrying the pull", stale)
+                rc, retry = git("pull", "--ff-only")
+                output = output + "\n-- removed a broken ORIG_HEAD and retried --\n" + retry
+            except OSError as exc:
+                output = output + f"\n-- could not remove {stale}: {exc} --"
         _rc, after = git("rev-parse", "HEAD")
         result = {"before": before[:10], "after": after[:10], "pull": output[-1500:],
                   "changed": before != after}
