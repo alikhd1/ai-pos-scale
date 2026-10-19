@@ -317,8 +317,19 @@ try:
     check("ping answers", win.support_action("ping", {})["pong"] is True)
     check("an unknown action is refused", _refuses(win, "exec", {}))
     check("an unknown setting is refused", _refuses(win, "set_setting", {"key": "pos.not_a_real_key", "value": 1}))
-    win.support_action("set_setting", {"key": "ai.top_k", "value": 4})
+    res_k = win.support_action("set_setting", {"key": "ai.top_k", "value": 4})
     check("a known setting can be changed", int(win.settings.get("ai.top_k")) == 4)
+    check("and one that needs a restart says so", res_k.get("applied_live") is False, str(res_k))
+
+    # switching a till to single-item mode remotely used to write the config
+    # and change nothing until a restart, while the Settings dialog applies the
+    # same key at once - the report said one thing and the till did another
+    res_p = win.support_action("set_setting", {"key": "ai.per_object_recognition", "value": False})
+    check("single-item mode reaches the running engine", win.engine.per_object is False,
+          str(win.engine.per_object))
+    check("and the reply says it is live", res_p.get("applied_live") is True, str(res_p))
+    win.support_action("set_setting", {"key": "ai.per_object_recognition", "value": True})
+    check("and back again", win.engine.per_object is True, str(win.engine.per_object))
     check("the channel obeys the setting that turned it off",
           win.support is None or not win.support.configured())
     check("but the build does know where it would report",

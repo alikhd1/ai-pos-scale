@@ -2467,8 +2467,9 @@ class MainWindow(QMainWindow):
             if self.settings.get(key, _MISSING) is _MISSING:
                 raise ValueError(f"no such setting: {key!r}")
             self._on_ui(lambda: (self.settings.set(key, value), self.settings.save()))
-            return {"key": key, "value": self.settings.get(key),
-                    "note": "a restart may be needed for this to take effect"}
+            live = self._on_ui(lambda: self._apply_setting_live(key))
+            return {"key": key, "value": self.settings.get(key), "applied_live": live,
+                    "note": "in effect now" if live else "saved; takes effect after a restart"}
         if name == "screenshot":
             return {"png_b64": self._on_ui(self._grab_window_png)}
         if name == "update":
@@ -2560,6 +2561,21 @@ class MainWindow(QMainWindow):
             log.exception("could not relaunch after update")
             return
         self.close()
+
+    def _apply_setting_live(self, key: str) -> bool:
+        """Push one changed setting into the running app, where that is possible.
+
+        Mirrors what saving the Settings dialog does. Returns False for keys
+        that only take effect on a restart, so the caller can say so instead
+        of implying the change is already live.
+        """
+        if key == "ai.per_object_recognition" and self.engine is not None:
+            self.engine.set_per_object(bool(self.settings.get(key, True)))
+            return True
+        if key.startswith("pos.") or key.startswith("support.") or key == "scale.stable_only":
+            # read fresh from settings every time they are used
+            return True
+        return False
 
     def _grab_window_png(self) -> str:
         buf = QBuffer()
