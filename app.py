@@ -95,6 +95,54 @@ SESSION_LOCK = "session.lock"
 CRASH_HISTORY = "crash_history.txt"
 
 
+INSTANCE_LOCK = "instance.lock"
+#: a remote update starts the replacement before the old copy has finished
+#: closing, so a new instance waits rather than refusing and leaving the shop
+#: with no till and no way in to fix it
+INSTANCE_WAIT_S = 25.0
+
+
+def acquire_single_instance(wait_s: float = INSTANCE_WAIT_S):
+    """Take the one-instance lock, or return None if another copy holds it.
+
+    A real lock, not a marker file: the operating system drops it when the
+    process ends, including a crash or a kill, so there is nothing to clean up
+    and nothing to go stale.
+    """
+    path = data_path(INSTANCE_LOCK)
+    try:
+        handle = open(path, "a+b")
+    except OSError as exc:
+        log.warning("cannot open %s (%s); continuing without the single-instance lock", path, exc)
+        return True                               # never block the till over this
+
+    def take() -> bool:
+        try:
+            if os.name == "nt":
+                import msvcrt
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except OSError:
+            return False
+
+    deadline = time.time() + max(0.0, wait_s)
+    while True:
+        if take():
+            handle.seek(0)
+            handle.truncate()
+            handle.write(f"{os.getpid()} {dt.datetime.now():%Y-%m-%d %H:%M:%S}".encode())
+            handle.flush()
+            return handle                         # keep it alive for the process's lifetime
+        if time.time() >= deadline:
+            handle.close()
+            return None
+        time.sleep(0.5)
+
+
 def session_begin() -> Optional[str]:
     """Write the heartbeat file; return the previous heartbeat if the last session did not end cleanly."""
     lock = data_path(SESSION_LOCK)
@@ -3480,6 +3528,14 @@ def build_gui(settings: SettingsManager, args) -> int:
     app.setStyleSheet(STYLE)
     if is_rtl():
         app.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
+    # before session_begin(), which would otherwise record the copy that is
+    # still running as a session that crashed
+    lock = acquire_single_instance()
+    if lock is None:
+        log.error("another copy of the app is already running; refusing to start a second one")
+        msg_error(None, tr("already_running"))
+        return 2
+    app._instance_lock = lock                     # held for as long as the app lives
     families = set(QFontDatabase.families())
     for fam in ("Vazirmatn", "Vazir", "IRANSans", "Segoe UI", "Tahoma"):
         if fam in families:

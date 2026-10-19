@@ -292,6 +292,12 @@ STRINGS = {
                      "تا وقتی آدرس و کلید را وارد نکنید هیچ چیزی ارسال نمی‌شود. صندوق فقط ارسال می‌کند و "
                      "هرگز پورتی باز نمی‌کند، و سرویس فقط می‌تواند همان فهرست ثابت کارهای پشتیبانی را "
                      "درخواست کند — امکان اجرای دستور روی این کامپیوتر وجود ندارد."),
+    "already_running": ("AI POS Scale is already running on this computer.\n\nUse the window that is "
+                        "already open. Two copies would fight over the camera and could damage the "
+                        "product database.",
+                        "برنامه از قبل روی این کامپیوتر در حال اجراست.\n\nاز همان پنجره‌ای که باز است "
+                        "استفاده کنید. دو نسخه هم‌زمان سر دوربین با هم تداخل می‌کنند و ممکن است به "
+                        "دیتابیس کالاها آسیب بزنند."),
     "tray_settling": ("Waiting for the view to be still - take your hands away from the tray",
                       "در انتظار ثابت شدن تصویر — دست‌ها را از روی سینی بردارید"),
     "tray_settle_timeout": ("The view never settled, so the empty tray was captured anyway. If "

@@ -120,7 +120,19 @@ try:
     check("and a commit", bool(b.get("commit")), str(b))
     check("it is always a dict, checkout or not", isinstance(b, dict))
 
-    print("\n[6] the camera search gives up quickly when there is nothing there")
+    print("\n[6] the backend is chosen for what the camera is asked to do")
+    # a real till reported it could not lock exposure or white balance: Media
+    # Foundation barely implements camera controls. That matters because a
+    # camera that re-exposes itself when a dark product lands on a white tray
+    # brightens the whole picture, so nothing matches the reference any more.
+    plain = [b[0] for b in RC.OpenCVCameraSource(0, 640, 480)._backends()]
+    locking = [b[0] for b in RC.OpenCVCameraSource(0, 640, 480, lock_exposure=True)._backends()]
+    check("normally Media Foundation leads", plain[0] == "MSMF", str(plain))
+    check("but DirectShow leads when the exposure must hold", locking[0] == "DSHOW", str(locking))
+    check("and nothing is dropped either way", sorted(plain) == sorted(locking),
+          f"{plain} vs {locking}")
+
+    print("\n[7] the camera search gives up quickly when there is nothing there")
     import time
     t0 = time.time()
     try:

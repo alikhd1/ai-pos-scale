@@ -578,6 +578,13 @@ class OpenCVCameraSource(CameraSource):
             # guaranteed: when it does work it is the most compatible path for
             # the cheap UVC modules these terminals ship with, and when it does
             # not it fails instantly and costs nothing.
+            #
+            # Media Foundation barely implements camera controls, so when the
+            # exposure lock is wanted DirectShow goes first - a camera that
+            # keeps re-exposing itself makes background subtraction impossible,
+            # which is a worse problem than whatever MSMF is better at.
+            if self.lock_exposure:
+                return [("DSHOW", cv2.CAP_DSHOW), ("MSMF", cv2.CAP_MSMF), ("ANY", cv2.CAP_ANY)]
             return [("MSMF", cv2.CAP_MSMF), ("DSHOW", cv2.CAP_DSHOW), ("ANY", cv2.CAP_ANY)]
         return [("ANY", cv2.CAP_ANY), ("V4L2", getattr(cv2, "CAP_V4L2", cv2.CAP_ANY))]
 
@@ -674,6 +681,11 @@ class OpenCVCameraSource(CameraSource):
         log.info("camera opened: %s", self.description)
         if self.lock_exposure and not self._is_file:
             self.lock_notes = self._freeze_auto(cap)
+            if label == "MSMF" and any("NOT be locked" in n for n in self.lock_notes):
+                # worth naming: it is the backend, not the camera
+                self.lock_notes.append("Media Foundation does not support camera controls; "
+                                       "DirectShow could not open this camera, so exposure "
+                                       "cannot be held steady on it")
             for note in self.lock_notes:
                 log.info("camera: %s", note)
 
